@@ -31,6 +31,7 @@ from constants import (
 )
 from ascent.llm_planner import Ascent_LLM_Planner
 from ascent.map_controller import Map_Controller
+from ascent.stair_policy import build_semantic_stair_frontier_policy
 from ascent.utils import (
     xyz_yaw_pitch_roll_to_tf_matrix,
     check_stairs_in_upper_50_percent,
@@ -185,6 +186,24 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
             target_object_list=self._map_controller._target_object, ##
             floor_probabilities_df=self.floor_probabilities_df
         )
+
+        # Reuse the planner's multimodal Qwen3.6 instance for Set-of-Marks
+        # stair scoring. The policy only replaces carrot-point generation;
+        # PointNav and floor switching stay owned by Ascent.
+        camera_intrinsic = np.array(
+            [
+                [self._fx, 0.0, self._cx],
+                [0.0, self._fy, self._cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        self._semantic_stair_policy = build_semantic_stair_frontier_policy(
+            num_envs=self._num_envs,
+            camera_intrinsic=camera_intrinsic,
+            device=str(self.device),
+            shared_qwen_vlm=self.llm_planner._llm,
+        )
     def _reset(self, env: int) -> None:
         ## 核心策略状态重置
         self._pointnav_policy[env].reset()
@@ -205,6 +224,7 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
         ## 爬楼梯相关状态重置
         # 防止之前episode爬楼梯异常退出
         self._pitch_angle[env] = 0
+        self._semantic_stair_policy.reset(env)
 
         ## 目标检测和探索相关状态重置
         # 防止识别正确之后造成误识别
@@ -321,8 +341,43 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
 
         # 绘制 frontiers
         policy_info["obstacle_map"] = cv2.cvtColor(self._map_controller._obstacle_map[env].visualize(), cv2.COLOR_BGR2RGB)
-        policy_info["vlm_input"] = self.llm_planner.frontier_rgb_list[env]
+        regular_vlm_inputs = self.llm_planner.frontier_rgb_list[env]
+        policy_info["vlm_input"] = regular_vlm_inputs
         policy_info["vlm_response"] = self.llm_planner.vlm_response[env]
+
+        # During stair traversal, show the exact Set-of-Marks image consumed by
+        # Qwen. Keep at most two regular exploration images so the existing
+        # three-image debug-video layout continues to render the panel.
+        stair_debug = self._policy_info[env].get("semantic_stair_frontiers")
+        if stair_debug is not None:
+            marked_rgb = stair_debug.get("marked_rgb")
+            if marked_rgb is not None and np.asarray(marked_rgb).size > 0:
+                if isinstance(regular_vlm_inputs, list):
+                    remaining_inputs = regular_vlm_inputs[:2]
+                elif regular_vlm_inputs is None:
+                    remaining_inputs = []
+                else:
+                    remaining_inputs = [regular_vlm_inputs]
+                policy_info["vlm_input"] = [np.asarray(marked_rgb)] + remaining_inputs
+
+                selected_index = stair_debug.get("selected_index")
+                labels = stair_debug.get("labels", [])
+                probabilities = stair_debug.get("probabilities", [])
+                utilities = stair_debug.get("utilities", [])
+                reasons = stair_debug.get("reasons", [])
+                if selected_index is not None and 0 <= selected_index < len(labels):
+                    direction = (
+                        "UP"
+                        if self._map_controller._climb_stair_flag[env] == 1
+                        else "DOWN"
+                    )
+                    probability = float(probabilities[selected_index])
+                    utility = float(utilities[selected_index])
+                    reason = reasons[selected_index]
+                    policy_info["vlm_response"] = (
+                        f"OpenFrontier {direction}: selected {labels[selected_index]}, "
+                        f"p={probability:.2f}, utility={utility:.3f}. {reason}"
+                    )
         policy_info["object_map"] = cv2.cvtColor(self._map_controller._object_map[env].visualize(), cv2.COLOR_BGR2RGB) 
         markers = []
         frontiers = self._observations_cache[env]["frontier_sensor"]
@@ -592,7 +647,7 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
             pointnav_action = torch.tensor([[action_numpy]], dtype=torch.int64, device=masks.device)
 
             # Check history and potentially override the action
-            if len(self.history_action[env]) >= 30: # Use >= to correctly handle the window size
+            if self._map_controller._climb_stair_over[env] and len(self.history_action[env]) >= 30: # Use >= to correctly handle the window size
                 # Store the first action before popping to see what it was, if needed for debugging
                 # old_action_in_history = self.history_action[env][0] 
                 self.history_action[env].pop(0) # Remove the oldest action to maintain window size
@@ -1070,57 +1125,146 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
             print("Adjusting pitch angle for downstair (looking up a little).")
             return get_action_tensor(LOOK_UP, device=masks.device)
         
-        # 阶段3: 沿楼梯方向前进 (胡萝卜策略)
+        # 阶段3: 沿楼梯方向前进（语义 Frontier，失败时回退到胡萝卜策略）
         else:
             distance = 0.8 # 目标点距离
 
-            depth_map = self._observations_cache[env]["nav_depth"].squeeze(0).cpu().numpy()
-            if depth_map.size == 0: # 避免空深度图
-                print("Warning: Depth map is empty. Cannot determine target point.")
-                return get_action_tensor(1, device=masks.device) # 默认向前
+            image_stair_mask = self._map_controller._stair_masks[env].astype(bool)
+            if len(self.red_semantic_pred_list) > env:
+                image_stair_mask = image_stair_mask | (
+                    self.red_semantic_pred_list[env] == STAIR_CLASS_ID
+                )
+            world_stair_map = (
+                self._map_controller._obstacle_map[env]._up_stair_map
+                if self._map_controller._climb_stair_flag[env] == 1
+                else self._map_controller._obstacle_map[env]._down_stair_map
+            )
+            semantic_subgoal = self._semantic_stair_policy.propose_subgoal(
+                env=env,
+                step=self._num_steps[env],
+                rgb=self._observations_cache[env]["rgb"],
+                normalized_depth=self._observations_cache[env]["depth"],
+                min_depth=self._observations_cache[env]["min_depth"],
+                max_depth=self._observations_cache[env]["max_depth"],
+                camera_to_world=self._observations_cache[env]["tf_camera_to_episodic"],
+                robot_xy=robot_xy,
+                heading=heading,
+                direction=self._map_controller._climb_stair_flag[env],
+                stair_mask=image_stair_mask,
+                world_stair_map=world_stair_map,
+                xy_to_px=self._map_controller._obstacle_map[env]._xy_to_px,
+            )
+            # Debug-video payload only. HabitatVis projects these episodic 3D
+            # anchors onto the top-down map; control never reads this field.
+            stair_debug = self._semantic_stair_policy.debug_snapshot(env)
+            self._policy_info[env]["semantic_stair_frontiers"] = stair_debug
 
-            max_value = np.max(depth_map)
-            max_indices = np.argwhere(depth_map == max_value)
-            
-            if max_indices.size == 0: # 避免没有最大值点
-                print("Warning: No max depth value found. Cannot determine target point.")
-                return get_action_tensor(1, device=masks.device) # 默认向前
+            # Print every A/B/C candidate once per fresh FrontierNet run.  The
+            # line below makes it explicit which marks were rejected before
+            # the single PointNav subgoal was selected.
+            if stair_debug.get("detection_step") == self._num_steps[env]:
+                candidate_lines = []
+                debug_labels = stair_debug.get("labels", [])
+                debug_points = np.asarray(
+                    stair_debug.get("points_xyz", []), dtype=float
+                ).reshape(-1, 3)
+                debug_probabilities = np.asarray(
+                    stair_debug.get("probabilities", []), dtype=float
+                ).reshape(-1)
+                debug_valid = np.asarray(
+                    stair_debug.get("valid", []), dtype=bool
+                ).reshape(-1)
+                debug_filter_reasons = stair_debug.get("filter_reasons", [])
+                for index, label in enumerate(debug_labels):
+                    point = (
+                        debug_points[index, :2]
+                        if index < len(debug_points)
+                        else np.array([np.nan, np.nan])
+                    )
+                    probability = (
+                        debug_probabilities[index]
+                        if index < len(debug_probabilities)
+                        else float("nan")
+                    )
+                    accepted = bool(debug_valid[index]) if index < len(debug_valid) else False
+                    filter_reason = (
+                        debug_filter_reasons[index]
+                        if index < len(debug_filter_reasons)
+                        else "unknown"
+                    )
+                    candidate_lines.append(
+                        f"{label}(p={probability:.2f}, "
+                        f"{'valid' if accepted else 'rejected'}, "
+                        f"goal={np.array2string(point, precision=2)}, "
+                        f"filter={filter_reason})"
+                    )
+                if candidate_lines:
+                    print("Semantic stair candidates: " + " | ".join(candidate_lines))
+                else:
+                    print("Semantic stair candidates: none; using legacy carrot")
 
-            center_point = np.mean(max_indices, axis=0).astype(int)
-            v, u = center_point[0], center_point[1]
-
-            normalized_u = np.clip((u - self._cx) / self._cx, -1, 1)
-            angle_offset = normalized_u * (self._camera_fov / 2)
-            target_heading = heading - angle_offset # 尝试减去角度偏移
-            target_heading = target_heading % (2 * np.pi)
-
-            x_target = robot_xy[0] + distance * np.cos(target_heading)
-            y_target = robot_xy[1] + distance * np.sin(target_heading)
-            current_target_point_xy = np.array([x_target, y_target])
-            current_target_point_px = self._map_controller._obstacle_map[env]._xy_to_px(np.atleast_2d(current_target_point_xy))
-
-            this_stair_end_px = self._map_controller._obstacle_map[env]._up_stair_end if self._map_controller._climb_stair_flag[env] == 1 else self._map_controller._obstacle_map[env]._down_stair_end
-
-            # 第一次或接近楼梯终点时重置胡萝卜目标点
-            if (len(self._map_controller._last_carrot_xy[env]) == 0 or this_stair_end_px.size == 0 or 
-                np.linalg.norm(this_stair_end_px - self._map_controller._obstacle_map[env]._xy_to_px(np.atleast_2d(robot_xy))[0]) <= 0.5 * self._map_controller._obstacle_map[env].pixels_per_meter or 
-                self._map_controller._obstacle_map[env]._disable_end):
-                
+            if semantic_subgoal is not None:
+                current_target_point_xy = semantic_subgoal.xy
+                current_target_point_px = self._map_controller._obstacle_map[env]._xy_to_px(
+                    np.atleast_2d(current_target_point_xy)
+                )
                 self._map_controller._carrot_goal_xy[env] = current_target_point_xy
                 self._map_controller._obstacle_map[env]._carrot_goal_px = current_target_point_px
                 self._map_controller._last_carrot_xy[env] = current_target_point_xy
                 self._map_controller._last_carrot_px[env] = current_target_point_px
+                print(
+                    "Semantic stair frontier "
+                    f"{semantic_subgoal.label}: p={semantic_subgoal.semantic_probability:.2f}, "
+                    f"utility={semantic_subgoal.utility:.3f}, goal={current_target_point_xy}, "
+                    f"reason={semantic_subgoal.reason}"
+                )
             else:
-                # 比较当前胡萝卜目标点与上次胡萝卜目标点到楼梯终点的L1距离
-                l1_distance_current = np.abs(this_stair_end_px[0] - current_target_point_px[0][0]) + np.abs(this_stair_end_px[1] - current_target_point_px[0][1])
-                l1_distance_last = np.abs(this_stair_end_px[0] - self._map_controller._last_carrot_px[env][0][0]) + np.abs(this_stair_end_px[1] - self._map_controller._last_carrot_px[env][0][1])
-                
-                if l1_distance_last > l1_distance_current: # 如果新的胡萝卜点离终点更近，则更新
+                # FrontierNet/VLM没有配置、无候选或推理失败时，保留原胡萝卜策略。
+                depth_map = self._observations_cache[env]["nav_depth"].squeeze(0).cpu().numpy()
+                if depth_map.size == 0: # 避免空深度图
+                    print("Warning: Depth map is empty. Cannot determine target point.")
+                    return get_action_tensor(1, device=masks.device) # 默认向前
+
+                max_value = np.max(depth_map)
+                max_indices = np.argwhere(depth_map == max_value)
+                if max_indices.size == 0: # 避免没有最大值点
+                    print("Warning: No max depth value found. Cannot determine target point.")
+                    return get_action_tensor(1, device=masks.device) # 默认向前
+
+                center_point = np.mean(max_indices, axis=0).astype(int)
+                v, u = center_point[0], center_point[1]
+                normalized_u = np.clip((u - self._cx) / self._cx, -1, 1)
+                angle_offset = normalized_u * (self._camera_fov / 2)
+                target_heading = (heading - angle_offset) % (2 * np.pi)
+                current_target_point_xy = np.array([
+                    robot_xy[0] + distance * np.cos(target_heading),
+                    robot_xy[1] + distance * np.sin(target_heading),
+                ])
+                current_target_point_px = self._map_controller._obstacle_map[env]._xy_to_px(
+                    np.atleast_2d(current_target_point_xy)
+                )
+                this_stair_end_px = (
+                    self._map_controller._obstacle_map[env]._up_stair_end
+                    if self._map_controller._climb_stair_flag[env] == 1
+                    else self._map_controller._obstacle_map[env]._down_stair_end
+                )
+
+                # 第一次或接近楼梯终点时重置胡萝卜目标点
+                if (len(self._map_controller._last_carrot_xy[env]) == 0 or this_stair_end_px.size == 0 or
+                    np.linalg.norm(this_stair_end_px - self._map_controller._obstacle_map[env]._xy_to_px(np.atleast_2d(robot_xy))[0]) <= 0.5 * self._map_controller._obstacle_map[env].pixels_per_meter or
+                    self._map_controller._obstacle_map[env]._disable_end):
                     self._map_controller._carrot_goal_xy[env] = current_target_point_xy
                     self._map_controller._obstacle_map[env]._carrot_goal_px = current_target_point_px
                     self._map_controller._last_carrot_xy[env] = current_target_point_xy
                     self._map_controller._last_carrot_px[env] = current_target_point_px
-                # 否则，保持上一个胡萝卜目标点不变，即 self._map_controller._carrot_goal_xy[env] 和 _carrot_goal_px 已经是 _last_carrot 的值
+                else:
+                    l1_distance_current = np.abs(this_stair_end_px[0] - current_target_point_px[0][0]) + np.abs(this_stair_end_px[1] - current_target_point_px[0][1])
+                    l1_distance_last = np.abs(this_stair_end_px[0] - self._map_controller._last_carrot_px[env][0][0]) + np.abs(this_stair_end_px[1] - self._map_controller._last_carrot_px[env][0][1])
+                    if l1_distance_last > l1_distance_current:
+                        self._map_controller._carrot_goal_xy[env] = current_target_point_xy
+                        self._map_controller._obstacle_map[env]._carrot_goal_px = current_target_point_px
+                        self._map_controller._last_carrot_xy[env] = current_target_point_xy
+                        self._map_controller._last_carrot_px[env] = current_target_point_px
 
             rho, theta = rho_theta(robot_xy, heading, self._map_controller._carrot_goal_xy[env])
             rho_theta_tensor = torch.tensor([[rho, theta]], device="cuda", dtype=torch.float32)

@@ -1,9 +1,8 @@
 from typing import Dict, Tuple, Any, Union, List
 import numpy as np
 import cv2
-import os
 import logging
-from model_api.qwen25_out import Qwen2_5Client
+from model_api.qwen36_out import Qwen3_6Client
 from ascent.mapping.object_point_cloud_map import ObjectPointCloudMap
 from ascent.mapping.obstacle_map import ObstacleMap
 from ascent.mapping.value_map import ValueMap
@@ -23,7 +22,7 @@ from constants import (
 import networkx as nx
 
 class Ascent_LLM_Planner:
-    def __init__(self, num_envs=1, nearby_distance = 3.0, topk = 3, target_object_list = [""], floor_probabilities_df=None):
+    def __init__(self, num_envs=1, nearby_distance = 3.0, topk = 3, target_object_list = [""], floor_probabilities_df=None, llm=None):
 
         self._num_envs = num_envs
         self._force_frontier = [np.zeros(2) for _ in range(self._num_envs)]
@@ -34,7 +33,8 @@ class Ascent_LLM_Planner:
         self._last_value = [float("-inf") for _ in range(self._num_envs)]
         self._last_frontier = [np.zeros(2) for _ in range(self._num_envs)]
         self._target_object = target_object_list
-        self._llm = Qwen2_5Client(port=int(os.environ.get("QWEN2_5_PORT", "13181")))
+        # One multimodal Qwen instance is shared with the semantic stair policy.
+        self._llm = llm if llm is not None else Qwen3_6Client()
         self.multi_floor_ask_step = [0 for _ in range(self._num_envs)]
         self.floor_probabilities_df = floor_probabilities_df
         self.frontier_rgb_list = [[] for _ in range(self._num_envs)]
@@ -636,4 +636,3 @@ class Ascent_LLM_Planner:
 
         # 如果解析失败或异常，返回当前楼层
         return cur_floor_index[env] + 1  # 当前楼层（从1开始）
-

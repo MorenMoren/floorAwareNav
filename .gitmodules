@@ -25,3 +25,9 @@
 [submodule "third_party/vlfm"]
 	path = third_party/vlfm
 	url = https://github.com/bdaiinstitute/vlfm.git
+[submodule "third_party/OpenFrontier"]
+	path = third_party/OpenFrontier
+	url = https://github.com/cvg/OpenFrontier.git
+[submodule "third_party/LINEA"]
+	path = third_party/LINEA
+	url = https://github.com/SebastianJanampa/LINEA.git

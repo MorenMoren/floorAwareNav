@@ -55,6 +55,25 @@ def str_to_bool_arr(s: str, shape: tuple) -> np.ndarray:
     unpacked = bytes_array.reshape(shape)
     return unpacked
 
+def depth_to_raw_base64(depth_np):
+    """
+    直接将内存数据转为字符串，不进行图像编码
+    """
+    # 获取原始字节
+    raw_bytes = depth_np.tobytes()
+    # 转 Base64
+    raw_str = base64.b64encode(raw_bytes).decode('utf-8')
+    return raw_str
+
+def str_to_depth_image(depth_str: str) -> np.ndarray:
+    # 1. 解码 Base64
+    # 1. Base64 解码回字节
+    img_bytes = base64.b64decode(depth_str)
+    # 2. 转换为 numpy 缓冲区
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    # 3. 使用 IMREAD_UNCHANGED 还原（极其重要，否则会丢失16位精度）
+    depth_np = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
+    return depth_np
 
 def image_to_str(img_np: np.ndarray, quality: float = 90.0) -> str:
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]

@@ -1,0 +1,6 @@
+# Optional dependencies for ascent.stair_policy.
+# Install this after the base Ascent/Habitat environment is working.
+hdbscan
+segmentation-models-pytorch==0.3.3
+albumentations==2.0.6
+gdown

@@ -11,6 +11,20 @@ from torch import Tensor
 
 habitat_version = ""
 
+
+def _load_checkpoint_compat(file_path: str):
+    """Load trusted legacy checkpoints across PyTorch 2.5/2.6.
+
+    PyTorch 2.6 changed ``torch.load``'s default to ``weights_only=True``.
+    The bundled PointNav checkpoint also stores an OmegaConf DictConfig, so it
+    must be loaded in the legacy full-checkpoint mode.
+    """
+    try:
+        return torch.load(file_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # ``weights_only`` is unavailable in older PyTorch versions.
+        return torch.load(file_path, map_location="cpu")
+
 try:
     import habitat
     from habitat_baselines.rl.ddppo.policy import PointNavResNetPolicy
@@ -171,9 +185,9 @@ def load_pointnav_policy(file_path: str, original_config=None) -> PointNavResNet
 
             # print(pointnav_policy)
             pointnav_policy.net = PointNavResNetNet(discrete_actions=True, no_fwd_dict=True)
-            state_dict = torch.load(file_path + ".state_dict", map_location="cpu")
+            state_dict = _load_checkpoint_compat(file_path + ".state_dict")
         else:
-            ckpt_dict = torch.load(file_path, map_location="cpu")
+            ckpt_dict = _load_checkpoint_compat(file_path)
 
             if original_config is not None:
                 config_to_use = original_config
@@ -185,7 +199,7 @@ def load_pointnav_policy(file_path: str, original_config=None) -> PointNavResNet
         return pointnav_policy
 
     else:
-        ckpt_dict = torch.load(file_path, map_location="cpu")
+        ckpt_dict = _load_checkpoint_compat(file_path)
         pointnav_policy = PointNavResNetTensorOutputPolicy()
         current_state_dict = pointnav_policy.state_dict()
         # Let old checkpoints work with new code

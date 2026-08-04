@@ -86,12 +86,14 @@ class HabitatVis:
             self.using_annotated_rgb = True
         else:
             rgb = observations["rgb"][0].cpu().numpy()
+        rgb = draw_semantic_stair_frontiers_on_rgb(rgb, policy_info[0])
         self.rgb.append(rgb)
 
         # Visualize target point cloud on the map
         color_point_cloud_on_map(infos, policy_info)
 
         map = maps.colorize_draw_agent_and_fit_to_height(infos[0]["top_down_map"], self.depth[0].shape[0])
+        map = draw_semantic_stair_frontiers_on_map(map, infos[0], policy_info[0])
         self.maps.append(map)
         vis_map_imgs = [
             self._reorient_rescale_habitat_map(infos, policy_info[0][vkey])
@@ -131,12 +133,16 @@ class HabitatVis:
             self.using_annotated_rgb[env] = True
         else:
             rgb = observations["rgb"][env].cpu().numpy()
+        rgb = draw_semantic_stair_frontiers_on_rgb(rgb, policy_info[env])
         self.rgb[env].append(rgb)
 
         # Visualize target point cloud on the map
         color_point_cloud_on_map(infos, policy_info, env)
 
         map = maps.colorize_draw_agent_and_fit_to_height(infos[env]["top_down_map"], self.depth[env][0].shape[0])
+        map = draw_semantic_stair_frontiers_on_map(
+            map, infos[env], policy_info[env]
+        )
         self.maps[env].append(map)
         vis_map_imgs = [
             self._reorient_rescale_habitat_map(infos[env], policy_info[env][vkey])
@@ -188,6 +194,9 @@ class HabitatVis:
             self.using_annotated_rgb[env] = True
         else:
             rgb = observations["rgb"][env].cpu().numpy()
+        rgb = draw_semantic_stair_frontiers_on_rgb(
+            rgb, policy_info[env] if policy_info is not None else None
+        )
         self.rgb[env].append(rgb)
 
         # 可视化目标点云在地图上的信息
@@ -196,6 +205,9 @@ class HabitatVis:
         # 获取地图信息
         map = maps.colorize_draw_agent_and_fit_to_height(
             infos[env]["top_down_map"], self.depth[env][0].shape[0]
+        )
+        map = draw_semantic_stair_frontiers_on_map(
+            map, infos[env], policy_info[env] if policy_info is not None else None
         )
         self.maps[env].append(map)
 
@@ -254,6 +266,7 @@ class HabitatVis:
             self.using_annotated_rgb[env] = True
         else:
             rgb = observations["rgb"][env].cpu().numpy()
+        rgb = draw_semantic_stair_frontiers_on_rgb(rgb, policy_info[env])
         self.rgb[env].append(rgb)
 
         # 可视化目标点云在地图上的信息
@@ -262,6 +275,9 @@ class HabitatVis:
         # 获取地图信息
         map = maps.colorize_draw_agent_and_fit_to_height(
             infos[env]["top_down_map"], self.depth[env][0].shape[0]
+        )
+        map = draw_semantic_stair_frontiers_on_map(
+            map, infos[env], policy_info[env]
         )
         self.maps[env].append(map)
         vis_map_imgs = [
@@ -959,6 +975,238 @@ def sim_xy_to_grid_xy(
         grid_xy = np.unique(grid_xy, axis=0)
 
     return grid_xy
+
+
+def draw_semantic_stair_frontiers_on_rgb(
+    rgb: np.ndarray,
+    policy_info: Optional[Dict[str, Any]],
+) -> np.ndarray:
+    """Draw OpenFrontier candidates directly on the full-resolution RGB view."""
+
+    if not policy_info or "semantic_stair_frontiers" not in policy_info:
+        return rgb
+    debug = policy_info["semantic_stair_frontiers"]
+    processed_pixels = np.asarray(
+        debug.get("image_pixels", []), dtype=float
+    ).reshape(-1, 2)
+    if len(processed_pixels) == 0:
+        return rgb
+
+    marked_rgb = debug.get("marked_rgb")
+    if marked_rgb is None or np.asarray(marked_rgb).size == 0:
+        return rgb
+    processed_h, processed_w = np.asarray(marked_rgb).shape[:2]
+    output = np.asarray(rgb).copy()
+    height, width = output.shape[:2]
+
+    # Invert OpenFrontier's resize + center-crop preprocessing.
+    scale = max(processed_h / height, processed_w / width) + 0.02
+    resized_h = int(round(height * scale))
+    resized_w = int(round(width * scale))
+    y_offset = max(0, (resized_h - processed_h) // 2)
+    x_offset = max(0, (resized_w - processed_w) // 2)
+
+    labels = list(debug.get("labels", []))
+    valid = np.asarray(debug.get("valid", []), dtype=bool).reshape(-1)
+    selected_index = debug.get("selected_index")
+    radius = max(9, min(height, width) // 35)
+    font_scale = max(0.55, min(height, width) / 700.0)
+    valid_color = (0, 255, 255)
+    filtered_color = (255, 165, 0)
+    selected_color = (255, 0, 255)
+
+    drew_candidate = False
+    for index, (processed_x, processed_y) in enumerate(processed_pixels):
+        if processed_x < 0 or processed_y < 0:
+            continue
+        x = int(round((processed_x + x_offset) / scale))
+        y = int(round((processed_y + y_offset) / scale))
+        if not (0 <= x < width and 0 <= y < height):
+            continue
+
+        label = labels[index] if index < len(labels) else str(index)
+        is_selected = selected_index is not None and index == selected_index
+        is_valid = bool(valid[index]) if index < len(valid) else False
+        color = selected_color if is_selected else (
+            valid_color if is_valid else filtered_color
+        )
+        thickness = -1 if is_selected else max(3, radius // 4)
+        cv2.circle(output, (x, y), radius, color, thickness, cv2.LINE_AA)
+        text_origin = (min(width - 20, x + radius + 4), max(22, y - radius))
+        cv2.putText(
+            output,
+            label,
+            text_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            output,
+            label,
+            text_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        drew_candidate = True
+
+    if drew_candidate:
+        title = "OpenFrontier stair candidates"
+        cv2.putText(
+            output,
+            title,
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            max(0.55, font_scale * 0.9),
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            output,
+            title,
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            max(0.55, font_scale * 0.9),
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    return output
+
+
+def draw_semantic_stair_frontiers_on_map(
+    rendered_map: np.ndarray,
+    info: Dict[str, Any],
+    policy_info: Optional[Dict[str, Any]],
+) -> np.ndarray:
+    """Overlay OpenFrontier stair candidates on a rendered Habitat map.
+
+    Candidate anchors are in Ascent's episodic XYZ frame. This follows the
+    target-point-cloud coordinate conversion, then accounts for Habitat's
+    optional map rotation and final resize. Drawing on a copy keeps this path
+    strictly observational.
+    """
+
+    if not policy_info or "semantic_stair_frontiers" not in policy_info:
+        return rendered_map
+    if "top_down_map" not in info:
+        return rendered_map
+
+    debug = policy_info["semantic_stair_frontiers"]
+    points = np.asarray(debug.get("points_xyz", []), dtype=float).reshape(-1, 3)
+    if len(points) == 0:
+        return rendered_map
+
+    top_down_map = info["top_down_map"]
+    try:
+        cloud_global_xyz = transform_points(
+            top_down_map["tf_episodic_to_global"], points
+        )
+        cloud_global_habitat = xyz_to_habitat(cloud_global_xyz)
+        sim_xy = cloud_global_habitat[:, [2, 0]]
+        grid_xy = sim_xy_to_grid_xy(
+            top_down_map["upper_bound"],
+            top_down_map["lower_bound"],
+            top_down_map["grid_resolution"],
+            sim_xy,
+            remove_duplicates=False,
+        )
+    except (KeyError, TypeError, ValueError, IndexError):
+        return rendered_map
+
+    raw_h, raw_w = top_down_map["map"].shape[:2]
+    rotated = raw_h > raw_w
+    oriented_h, oriented_w = (raw_w, raw_h) if rotated else (raw_h, raw_w)
+    output = rendered_map.copy()
+    out_h, out_w = output.shape[:2]
+    labels = list(debug.get("labels", []))
+    valid = np.asarray(debug.get("valid", []), dtype=bool).reshape(-1)
+    selected_label = debug.get("selected_label")
+    selected_index = debug.get("selected_index")
+
+    radius = max(4, min(out_h, out_w) // 55)
+    font_scale = max(0.35, min(out_h, out_w) / 900.0)
+    # Values are RGB because HabitatVis frames are RGB arrays.
+    valid_color = (0, 255, 255)
+    filtered_color = (255, 165, 0)
+    selected_color = (255, 0, 255)
+
+    for index, (row, col) in enumerate(grid_xy):
+        if not (0 <= row < raw_h and 0 <= col < raw_w):
+            continue
+        if rotated:
+            oriented_row, oriented_col = raw_w - 1 - col, row
+        else:
+            oriented_row, oriented_col = row, col
+        px = int(round((oriented_col + 0.5) * out_w / oriented_w - 0.5))
+        py = int(round((oriented_row + 0.5) * out_h / oriented_h - 0.5))
+        px = int(np.clip(px, 0, out_w - 1))
+        py = int(np.clip(py, 0, out_h - 1))
+
+        label = labels[index] if index < len(labels) else str(index)
+        is_selected = (
+            index == selected_index
+            if selected_index is not None
+            else label == selected_label
+        )
+        is_valid = bool(valid[index]) if index < len(valid) else False
+        color = selected_color if is_selected else (
+            valid_color if is_valid else filtered_color
+        )
+        thickness = -1 if is_selected else max(2, radius // 3)
+        cv2.circle(output, (px, py), radius, color, thickness, cv2.LINE_AA)
+        text_origin = (px + radius + 2, max(12, py - radius))
+        cv2.putText(
+            output,
+            label,
+            text_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            output,
+            label,
+            text_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    legend = "OpenFrontier: cyan=valid orange=filtered magenta=selected"
+    legend_origin = (8, max(16, out_h - 10))
+    legend_scale = max(0.3, font_scale * 0.75)
+    cv2.putText(
+        output,
+        legend,
+        legend_origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        legend_scale,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        output,
+        legend,
+        legend_origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        legend_scale,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    return output
 
 
 def color_point_cloud_on_map(infos: List[Dict[str, Any]], policy_info: List[Dict[str, Any]], env: int = 0) -> None:

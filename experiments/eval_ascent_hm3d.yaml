@@ -6,7 +6,7 @@ defaults:
       - compass_sensor
       - gps_sensor
       - heading_sensor
-      - frontier_sensor
+      #- frontier_sensor
   - /habitat/task/measurements:
     - multi_floor_map # frontier_exploration_map
     - traveled_stairs
@@ -16,7 +16,7 @@ defaults:
 habitat:
   environment:
     iterator_options:
-      max_scene_repeat_steps: 50000
+      max_scene_repeat_steps: 60000
       shuffle: False
   task:
     success_reward: 2.5
@@ -25,6 +25,14 @@ habitat:
       base_explorer:
         turn_angle: 30
         area_thresh: 1.5
+    #type: ObjectNav-v2
+    measurements:
+      success:
+        success_distance: 0.6
+  # simulator:
+  #   SCENE_DATASET: "DATA/HM3D/scene_datasets/hm3d_v0.2/hm3d/hm3d_annotated_basis.scene_dataset_config.json"
+  # SUCCESS:
+  #   SUCCESS_DISTANCE: 0.1
 
 habitat_baselines:
   evaluate: True
@@ -34,7 +42,7 @@ habitat_baselines:
   verbose: false
   torch_gpu_id: 0
   tensorboard_dir: "debug/tb_hm3d_debug"
-  video_dir: "debug/video_hm3d_debug"
+  video_dir: "debug/video_hm3d_debug_linea_v6"              #v3_fuse_new_stair   #v4_no_fuse_new_stair #v5_map_update to match the stair climbing #v6 more_num_env
   test_episode_count: -1
   checkpoint_folder: "debug/"
   trainer_name: "ascent"
