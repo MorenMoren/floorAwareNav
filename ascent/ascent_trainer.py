@@ -37,8 +37,47 @@ from omegaconf import OmegaConf
 from habitat_baselines.rl.ppo.evaluator import pause_envs ## For Habitat 3.0 
 from gym import spaces
 import time
+
+
+_SKIP_INFO_VALUE = object()
+_REPORTED_NONE_INFO_PATHS = set()
+
+
+def _filter_non_scalar_info(value: Any, path: str = "") -> Any:
+    """Remove values that Habitat's scalar metric extractor cannot handle.
+
+    The upstream extractor recursively calls ``float`` for every scalar-like
+    value.  ``None`` is scalar-like according to ``numpy.size`` but cannot be
+    converted to a float, so an optional/uninitialised nested metric can abort
+    an otherwise completed evaluation episode.
+    """
+    if value is None:
+        if path and path not in _REPORTED_NONE_INFO_PATHS:
+            logger.warning(
+                f"Ignoring evaluation info field '{path}' because its value is None."
+            )
+            _REPORTED_NONE_INFO_PATHS.add(path)
+        return _SKIP_INFO_VALUE
+
+    # Preserve the wrapper's existing behaviour, but apply it recursively so
+    # lists nested inside custom metrics cannot reach Habitat's float(...).
+    if isinstance(value, list):
+        return _SKIP_INFO_VALUE
+
+    if isinstance(value, dict):
+        filtered = {}
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            child_filtered = _filter_non_scalar_info(child, child_path)
+            if child_filtered is not _SKIP_INFO_VALUE:
+                filtered[key] = child_filtered
+        return filtered
+
+    return value
+
+
 def extract_scalars_from_info(info: Dict[str, Any]) -> Dict[str, float]:
-    info_filtered = {k: v for k, v in info.items() if not isinstance(v, list)}
+    info_filtered = _filter_non_scalar_info(info)
     return extract_scalars_from_info_habitat(info_filtered)
 
 

@@ -248,9 +248,23 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
             return
         rgb = observations["rgb"][env].cpu().numpy() ## modify this to fit on multiple environments
         depth = observations["depth"][env].cpu().numpy()
-        x, y = observations["gps"][env].cpu().numpy()
+        gps = np.asarray(observations["gps"][env].cpu().numpy(), dtype=float)
+        if gps.shape == (3,):
+            habitat_x, robot_height, habitat_z = gps
+            x, y = -habitat_z, habitat_x
+        elif gps.shape == (2,):
+            # Backward-compatible fallback. Height-based stair exit guarding
+            # is disabled when the task still exposes a 2D GPS sensor.
+            x, y = gps
+            robot_height = float("nan")
+        else:
+            raise ValueError(f"Expected a 2D or 3D GPS observation, got {gps.shape}")
         camera_yaw = observations["compass"][env].cpu().item()
         depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
+        # Keep mapping in ASCENT's existing per-floor local-height frame.
+        # The real episodic height is cached separately and is used only by
+        # the stair-exit state guard; adding it here would make upper-floor
+        # points fail ObstacleMap's fixed min/max-height filters.
         camera_position = np.array([x, -y, self._camera_height])
         robot_xy = camera_position[:2]
         camera_pitch = np.radians(-self._pitch_angle[env]) # 应该是弧度制 -
@@ -259,6 +273,7 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
 
         self._observations_cache[env] = {
             "robot_xy": robot_xy,
+            "robot_height": float(robot_height),
             "robot_heading": camera_yaw,
             "tf_camera_to_episodic": tf_camera_to_episodic,
             "rgb": rgb,
@@ -290,6 +305,7 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
         policy_info = {
             "target_object": self._map_controller._target_object[env].split("|")[0],
             "gps": str(self._observations_cache[env]["robot_xy"] * np.array([1, -1])),
+            "height": self._observations_cache[env]["robot_height"],
             "yaw": np.rad2deg(self._observations_cache[env]["robot_heading"]),
             "target_detected": self._map_controller._object_map[env].has_object(self._map_controller._target_object[env]),
             "target_point_cloud": target_point_cloud,
@@ -510,7 +526,13 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
                         mode = "look_down_twice"
                         pointnav_action = get_action_tensor(LOOK_DOWN, device=masks.device)
                     else:
-                        if self._map_controller._obstacle_map[env]._climb_stair_paused_step < 30:
+                        semantic_goal_locked = (
+                            self._semantic_stair_policy.has_active_subgoal(env)
+                        )
+                        if (
+                            self._map_controller._obstacle_map[env]._climb_stair_paused_step < 30
+                            or semantic_goal_locked
+                        ):
                             mode = "climb_stair"
                             pointnav_action = self._climb_stair(observations, env, masks)
                         else:
@@ -556,10 +578,16 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
                             # 继续原有的初始化逻辑
                             mode = "climb_stair_initialize"
                             if self._pitch_angle[env] > 0:
-                                self._pitch_angle[env] -= self._pitch_angle_offset
+                                self._pitch_angle[env] = max(
+                                    0,
+                                    self._pitch_angle[env] - self._pitch_angle_offset,
+                                )
                                 pointnav_action = get_action_tensor(LOOK_DOWN, device=masks.device)
                             elif self._pitch_angle[env] < 0:
-                                self._pitch_angle[env] += self._pitch_angle_offset
+                                self._pitch_angle[env] = min(
+                                    0,
+                                    self._pitch_angle[env] + self._pitch_angle_offset,
+                                )
                                 pointnav_action = get_action_tensor(LOOK_UP, device=masks.device)
                             else:
                                 self._map_controller._obstacle_map[env]._done_initializing = False # for initial floor and new floor
@@ -610,13 +638,24 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
                         mode = "get_close_to_stair"
                         pointnav_action = self._get_close_to_stair(observations, env, masks)
             else: # 非楼梯爬行状态下的通用导航和探索逻辑
+                # A semantic stair goal is intentionally locked for the
+                # duration of one climb segment.  Clear it as soon as Ascent's
+                # floor-state machine leaves stair traversal so it cannot be
+                # reused by a later staircase in the same episode.
+                self._semantic_stair_policy.reset(env)
                 if self._pitch_angle[env] > 0:
                     mode = "look_down_back"
-                    self._pitch_angle[env] -= self._pitch_angle_offset
+                    self._pitch_angle[env] = max(
+                        0,
+                        self._pitch_angle[env] - self._pitch_angle_offset,
+                    )
                     pointnav_action = get_action_tensor(LOOK_DOWN, device=masks.device)
                 elif self._pitch_angle[env] < 0 and not self._map_controller._obstacle_map[env]._look_for_downstair_flag:
                     mode = "look_up_back"
-                    self._pitch_angle[env] += self._pitch_angle_offset
+                    self._pitch_angle[env] = min(
+                        0,
+                        self._pitch_angle[env] + self._pitch_angle_offset,
+                    )
                     pointnav_action = get_action_tensor(LOOK_UP, device=masks.device)
                 elif not self._map_controller._done_initializing[env]:
                     self._map_controller._obstacle_map[env]._done_initializing = True
@@ -1085,23 +1124,26 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
             print(f"Error: Stair frontier for climb_stair_flag {self._map_controller._climb_stair_flag[env]} is empty. Returning to explore.")
             return self._explore(observations, env, ori_masks)
 
-        current_distance = np.linalg.norm(target_stair_frontier[0] - robot_xy)
-        print(f"Climb Stair - Distance Change: {np.abs(self._last_frontier_distance[env] - current_distance):.2f}m, Climb Stair Paused Step: {self._map_controller._obstacle_map[env]._climb_stair_paused_step}")
-
-        # 检测是否卡顿在楼梯上
-        if np.abs(self._last_frontier_distance[env] - current_distance) > 0.2:
-            self._map_controller._obstacle_map[env]._climb_stair_paused_step = 0
-            self._last_frontier_distance[env] = current_distance
-        else:
-            self._map_controller._obstacle_map[env]._climb_stair_paused_step += 1
-        
-        if self._map_controller._obstacle_map[env]._climb_stair_paused_step > 15:
-            # 如果长时间卡顿，可能楼梯已经走完，或者遇到了障碍
-            self._map_controller._obstacle_map[env]._disable_end = True # 标记楼梯终点可能不可达
-
         # 阶段1: 接近楼梯质心 (如果尚未到达)
         if not self._map_controller._reach_stair_centroid[env]:
             stair_centroid_point = target_stair_frontier[0] # 楼梯的质心点
+            current_distance = float(np.linalg.norm(stair_centroid_point - robot_xy))
+            distance_change = abs(self._last_frontier_distance[env] - current_distance)
+            print(
+                "Climb Stair Centroid - Distance Change: "
+                f"{distance_change:.2f}m, Paused Step: "
+                f"{self._map_controller._obstacle_map[env]._climb_stair_paused_step}"
+            )
+
+            if distance_change > 0.2:
+                self._map_controller._obstacle_map[env]._climb_stair_paused_step = 0
+                self._last_frontier_distance[env] = current_distance
+            else:
+                self._map_controller._obstacle_map[env]._climb_stair_paused_step += 1
+
+            if self._map_controller._obstacle_map[env]._climb_stair_paused_step > 15:
+                self._map_controller._obstacle_map[env]._disable_end = True
+
             rho, theta = rho_theta(robot_xy, heading, stair_centroid_point)
             rho_theta_tensor = torch.tensor([[rho, theta]], device="cuda", dtype=torch.float32)
             
@@ -1114,11 +1156,56 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
             
             if action.item() == 0:
                 self._map_controller._reach_stair_centroid[env] = True
+                self._map_controller._obstacle_map[env]._climb_stair_paused_step = 0
+                self._last_frontier_distance[env] = 0.0
                 print("Agent is near stair centroid, switching to move forward.")
                 action[0] = 1 # 强制向前移动
             return action
 
-        # 阶段2: 视角调整 (如果需要)
+        # 阶段2: 上楼 semantic frontier 的相机循环。
+        # FrontierNet 始终在平视状态运行；选中目标后抬头交给 PointNav，
+        # 到达目标 0.8m 内后释放目标并恢复平视，再检测下一段。
+        if self._map_controller._climb_stair_flag[env] == 1:
+            active_distance = self._semantic_stair_policy.active_subgoal_distance(
+                env, robot_xy
+            )
+            if (
+                active_distance is not None
+                and active_distance
+                <= self._semantic_stair_policy.config.goal_reached_distance
+            ):
+                print(
+                    "Reached semantic stair frontier: "
+                    f"distance={active_distance:.2f}m <= "
+                    f"{self._semantic_stair_policy.config.goal_reached_distance:.2f}m; "
+                    "returning camera to level before the next detection."
+                )
+                self._semantic_stair_policy.complete_active_subgoal(env)
+                self._map_controller._carrot_goal_xy[env] = []
+                self._map_controller._last_carrot_xy[env] = []
+                self._map_controller._last_carrot_px[env] = []
+                self._map_controller._obstacle_map[env]._carrot_goal_px = np.array([])
+                self._map_controller._obstacle_map[env]._climb_stair_paused_step = 0
+                self._map_controller._obstacle_map[env]._disable_end = False
+                self._last_frontier_distance[env] = 0.0
+
+            if not self._semantic_stair_policy.has_active_subgoal(env):
+                if self._pitch_angle[env] > 0:
+                    self._pitch_angle[env] = max(
+                        0,
+                        self._pitch_angle[env] - self._pitch_angle_offset,
+                    )
+                    print("Leveling camera before the next stair frontier detection.")
+                    return get_action_tensor(LOOK_DOWN, device=masks.device)
+                if self._pitch_angle[env] < 0:
+                    self._pitch_angle[env] = min(
+                        0,
+                        self._pitch_angle[env] + self._pitch_angle_offset,
+                    )
+                    print("Leveling camera before the next stair frontier detection.")
+                    return get_action_tensor(LOOK_UP, device=masks.device)
+
+        # 下楼保持已有的视角调整逻辑。
         # 仅在下楼梯且俯仰角过高时调整
         if self._map_controller._climb_stair_flag[env] == 2 and self._pitch_angle[env] < -30: 
             self._pitch_angle[env] += self._pitch_angle_offset
@@ -1212,12 +1299,49 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
                 self._map_controller._obstacle_map[env]._carrot_goal_px = current_target_point_px
                 self._map_controller._last_carrot_xy[env] = current_target_point_xy
                 self._map_controller._last_carrot_px[env] = current_target_point_px
+
+                semantic_distance = float(
+                    np.linalg.norm(current_target_point_xy - robot_xy)
+                )
+                detected_this_step = (
+                    stair_debug.get("detection_step") == self._num_steps[env]
+                )
+                if detected_this_step or self._last_frontier_distance[env] <= 0:
+                    semantic_progress = 0.0
+                else:
+                    semantic_progress = (
+                        self._last_frontier_distance[env] - semantic_distance
+                    )
+                self._last_frontier_distance[env] = semantic_distance
+
+                # This legacy counter is also interpreted by MapController
+                # when the robot leaves the stair mask.  Keeping it at zero
+                # while a semantic goal is locked prevents a successful exit
+                # from being mislabeled as a 30-step centroid timeout.
+                self._map_controller._obstacle_map[env]._climb_stair_paused_step = 0
+                self._map_controller._obstacle_map[env]._disable_end = False
                 print(
                     "Semantic stair frontier "
                     f"{semantic_subgoal.label}: p={semantic_subgoal.semantic_probability:.2f}, "
                     f"utility={semantic_subgoal.utility:.3f}, goal={current_target_point_xy}, "
                     f"reason={semantic_subgoal.reason}"
                 )
+                print(
+                    "Semantic Stair Goal - Distance: "
+                    f"{semantic_distance:.2f}m, Progress: {semantic_progress:.2f}m, "
+                    "Locked: True"
+                )
+
+                if (
+                    self._map_controller._climb_stair_flag[env] == 1
+                    and self._pitch_angle[env] <= 0
+                ):
+                    self._pitch_angle[env] += self._pitch_angle_offset
+                    print(
+                        "Semantic stair frontier selected; looking up before "
+                        "PointNav traversal."
+                    )
+                    return get_action_tensor(LOOK_UP, device=masks.device)
             else:
                 # FrontierNet/VLM没有配置、无候选或推理失败时，保留原胡萝卜策略。
                 depth_map = self._observations_cache[env]["nav_depth"].squeeze(0).cpu().numpy()
@@ -1265,6 +1389,34 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
                         self._map_controller._obstacle_map[env]._carrot_goal_px = current_target_point_px
                         self._map_controller._last_carrot_xy[env] = current_target_point_xy
                         self._map_controller._last_carrot_px[env] = current_target_point_px
+
+                # Preserve the original centroid-based timeout only for the
+                # legacy carrot fallback.  Semantic goals use their own locked
+                # world-space distance above and must not feed this counter.
+                legacy_distance = float(
+                    np.linalg.norm(target_stair_frontier[0] - robot_xy)
+                )
+                if self._last_frontier_distance[env] <= 0:
+                    legacy_distance_change = 0.0
+                    self._last_frontier_distance[env] = legacy_distance
+                    self._map_controller._obstacle_map[env]._climb_stair_paused_step = 0
+                else:
+                    legacy_distance_change = abs(
+                        self._last_frontier_distance[env] - legacy_distance
+                    )
+                    if legacy_distance_change > 0.2:
+                        self._map_controller._obstacle_map[env]._climb_stair_paused_step = 0
+                        self._last_frontier_distance[env] = legacy_distance
+                    else:
+                        self._map_controller._obstacle_map[env]._climb_stair_paused_step += 1
+
+                if self._map_controller._obstacle_map[env]._climb_stair_paused_step > 15:
+                    self._map_controller._obstacle_map[env]._disable_end = True
+                print(
+                    "Legacy Stair Carrot - Centroid Distance Change: "
+                    f"{legacy_distance_change:.2f}m, Paused Step: "
+                    f"{self._map_controller._obstacle_map[env]._climb_stair_paused_step}"
+                )
 
             rho, theta = rho_theta(robot_xy, heading, self._map_controller._carrot_goal_xy[env])
             rho_theta_tensor = torch.tensor([[rho, theta]], device="cuda", dtype=torch.float32)

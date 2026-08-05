@@ -6,6 +6,7 @@ import os
 from ascent.mapping.object_point_cloud_map import ObjectPointCloudMap
 from ascent.mapping.obstacle_map import ObstacleMap
 from ascent.mapping.value_map import ValueMap
+from ascent.stair_policy.height_guard import StairHeightGuard
 from constants import (
     PROMPT_SEPARATOR,
 )
@@ -130,6 +131,7 @@ class Map_Controller:
         self._passive_up_stair_steps: List[int] = [0] * self._num_envs
         self._passive_down_stair_steps: List[int] = [0] * self._num_envs
         self.PASSIVE_STAIR_DETECTION_THRESHOLD = 3  # 连续3步在楼梯区域内即触发
+        self._stair_height_guard = StairHeightGuard(self._num_envs)
     def reset(self, env: int) -> None:
         self._cur_floor_index[env] = 0
         # 确保只保留第一层的地图实例并重置它们
@@ -178,6 +180,7 @@ class Map_Controller:
         self.cur_dis_to_goal[env] = np.inf
         self._passive_up_stair_steps[env] = 0
         self._passive_down_stair_steps[env] = 0
+        self._stair_height_guard.reset(env)
     def is_robot_in_stair_map_fast(self, env: int, robot_px:np.ndarray, stair_map: np.ndarray):
         """
         高效判断以机器人质心为圆心、指定半径的圆是否覆盖 stair_map 中值为 1 的点。
@@ -256,12 +259,29 @@ class Map_Controller:
         self._obstacle_map[env] = self._obstacle_map_list[env][self._cur_floor_index[env]]
         self._value_map[env] = self._value_map_list[env][self._cur_floor_index[env]]
 
-    def _process_stair_climb_state(self, env: int, robot_xy: np.ndarray, robot_px: np.ndarray, stair_map: np.ndarray, climb_direction: int):
+    def _process_stair_climb_state(
+        self,
+        env: int,
+        robot_xy: np.ndarray,
+        robot_px: np.ndarray,
+        robot_height: float,
+        stair_map: np.ndarray,
+        climb_direction: int,
+    ):
         """
         处理机器人达到或离开楼梯的状态逻辑。
         climb_direction: 1 表示上楼，2 表示下楼
         """
         already_reach_stair, reach_yx = self.is_robot_in_stair_map_fast(env, robot_px, stair_map)
+        height_decision = self._stair_height_guard.update(
+            env=env,
+            height=robot_height,
+            direction=climb_direction,
+            # Exit confirmation is meaningful only after the centroid phase.
+            # Before then, retain height history but do not accumulate
+            # map-outside confirmation steps.
+            in_stair_map=(already_reach_stair or not self._reach_stair_centroid[env]),
+        )
 
         if not self._reach_stair[env]:
             if already_reach_stair:
@@ -275,8 +295,35 @@ class Map_Controller:
             if self._stair_frontier[env] is not None and \
                np.linalg.norm(self._stair_frontier[env] - np.atleast_2d(robot_xy)) <= 0.3: # 注意这里原来是robot_xy_2d，改为robot_px[0]以匹配px_to_xy的转换
                 self._reach_stair_centroid[env] = True
+                # The centroid approach and semantic stair traversal are two
+                # independent navigation segments.  Do not let stalled steps
+                # accumulated while approaching the centroid consume the
+                # semantic subgoal's traversal budget.
+                self._obstacle_map[env]._climb_stair_paused_step = 0
         else: # _reach_stair_centroid[env] == True
-            if not self.is_robot_in_stair_map_fast(env, robot_px, stair_map)[0] and \
+            if not already_reach_stair and not height_decision.allow_map_exit:
+                direction_name = "up" if climb_direction == 1 else "down"
+                print(
+                    "Stair height guard: map_outside=True, "
+                    f"direction={direction_name}, height={robot_height:.3f}m, "
+                    f"recent_directional_change={height_decision.directional_change:.3f}m, "
+                    f"height_changing={height_decision.height_changing}, "
+                    "outside_stable_steps="
+                    f"{height_decision.outside_stable_steps}/"
+                    f"{self._stair_height_guard.config.exit_stable_steps}; "
+                    "keeping climb_stair active."
+                )
+                return
+
+            if not already_reach_stair:
+                print(
+                    "Stair exit confirmed: map_outside=True, "
+                    f"height={robot_height:.3f}m, "
+                    f"recent_directional_change={height_decision.directional_change:.3f}m, "
+                    "height_stable=True."
+                )
+
+            if not already_reach_stair and \
                self._obstacle_map[env]._climb_stair_paused_step >= 30:
                 self._reset_stair_climb_state(env)
                 self._climb_stair_over[env] = True
@@ -296,7 +343,7 @@ class Map_Controller:
                     self._remove_floor_map(env, self._cur_floor_index[env] - 1)
                     self._cur_floor_index[env] -= 1 # 如果下楼的楼梯是误判，那么当前层需要往下减一层了
 
-            elif not self.is_robot_in_stair_map_fast(env, robot_px, stair_map)[0]:
+            elif not already_reach_stair:
                 self._reset_stair_climb_state(env)
                 self._climb_stair_over[env] = True
                 if climb_direction == 1:
@@ -324,6 +371,7 @@ class Map_Controller:
         self._obstacle_map[env]._climb_stair_paused_step = 0
         self._last_carrot_xy[env] = []
         self._last_carrot_px[env] = []
+        self._stair_height_guard.reset(env)
 
     def _disable_stair_and_reset_state(self, env: int, disabled_frontier: np.ndarray, is_reverse: bool = False):
         """
@@ -349,6 +397,7 @@ class Map_Controller:
         self._climb_stair_over[env] = True # 标记楼梯操作已结束
         self._climb_stair_flag[env] = 0 # 重置爬楼梯标志
         self._obstacle_map[env]._disable_end = False # 重置楼梯终点禁用标记
+        self._stair_height_guard.reset(env)
 
         # 根据上楼/下楼情况更新地图和楼层信息
         if self._climb_stair_flag[env] == 1: # 上楼被禁用
@@ -387,6 +436,7 @@ class Map_Controller:
         self._reach_stair[env] = False
         self._reach_stair_centroid[env] = False
         self._stair_dilate_flag[env] = False
+        self._stair_height_guard.reset(env)
 
     def _handle_stair_floor_change(self, env: int, direction: int, stair_map_prev_floor, stair_start_prev_floor, stair_end_prev_floor, stair_frontiers_prev_floor, stair_map_cur_floor_attr, stair_start_cur_floor_attr, stair_end_cur_floor_attr, stair_frontiers_cur_floor_attr):
         """处理楼层切换时楼梯地图的更新逻辑。
@@ -477,10 +527,12 @@ class Map_Controller:
     def _update_obstacle_map(self, observations_cache: List[Dict], red_semantic_pred_list: List[np.array], pitch_angle: List[int]) -> None:
         for env in range(self._num_envs):
             robot_xy = observations_cache[env]["robot_xy"]
+            robot_height = float(observations_cache[env].get("robot_height", np.nan))
             robot_px = self._obstacle_map[env]._xy_to_px(np.atleast_2d(robot_xy))
             
             # ✅ 新增：被动检测楼梯（仅在非爬楼梯状态时）
             if self._climb_stair_over[env] and self._climb_stair_flag[env] == 0:
+                self._stair_height_guard.reset(env)
                 self._detect_passive_stair_entry(env, robot_px)
             
             # 原有的爬楼梯状态处理
@@ -503,7 +555,14 @@ class Map_Controller:
                         self._temp_stair_map[env] = stair_map_to_use
                     
                     # 处理楼梯状态
-                    self._process_stair_climb_state(env, robot_xy, robot_px, self._temp_stair_map[env], self._climb_stair_flag[env])
+                    self._process_stair_climb_state(
+                        env,
+                        robot_xy,
+                        robot_px,
+                        robot_height,
+                        self._temp_stair_map[env],
+                        self._climb_stair_flag[env],
+                    )
 
 
             self._obstacle_map[env].update_map(
@@ -679,6 +738,7 @@ class Map_Controller:
         self._reach_stair[env] = True
         self._reach_stair_centroid[env] = False  # 被动进入时，可能还未到达质心
         self._get_close_to_stair_step[env] = 0
+        self._stair_height_guard.reset(env)
         
         if climb_direction == 1:
             self._obstacle_map[env]._up_stair_start = robot_px[0].copy()

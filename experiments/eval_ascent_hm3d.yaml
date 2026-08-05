@@ -25,6 +25,8 @@ habitat:
       base_explorer:
         turn_angle: 30
         area_thresh: 1.5
+      gps_sensor:
+        dimensionality: 3
     #type: ObjectNav-v2
     measurements:
       success:

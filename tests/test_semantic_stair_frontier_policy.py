@@ -114,9 +114,9 @@ class SemanticStairFrontierPolicyTest(unittest.TestCase):
         self.assertTrue(result.used_vlm)
         self.assertEqual(scorer.last_direction, StairDirection.UP)
 
-    def test_cached_goal_skips_detector_until_replan_interval(self):
+    def test_selected_goal_stays_locked_until_robot_is_within_point_eight_metres(self):
         detector = FakeDetector(
-            [StairFrontierCandidate("A", (10, 10), np.array([1.0, 0.0]), 1.0, 1.0)]
+            [StairFrontierCandidate("A", (10, 10), np.array([2.0, 0.0]), 1.0, 1.0)]
         )
         policy = SemanticStairFrontierPolicy(
             detector,
@@ -126,18 +126,58 @@ class SemanticStairFrontierPolicyTest(unittest.TestCase):
         )
         inputs = self.make_inputs()
         first = policy.propose_subgoal(**inputs)
-        inputs["step"] = 11
-        inputs["robot_xy"] = np.array([0.1, 0.0])
-        second = policy.propose_subgoal(**inputs)
+        self.assertTrue(policy.has_active_subgoal(0))
+        self.assertAlmostEqual(
+            policy.active_subgoal_distance(0, np.array([0.0, 0.0])),
+            2.0,
+        )
+
+        # Exceed both the old four-step replan interval and the old eight-step
+        # stagnation threshold.  The selected world point must remain locked.
+        for step in range(11, 31):
+            inputs["step"] = step
+            inputs["robot_xy"] = np.array([0.0, 0.0])
+            locked = policy.propose_subgoal(**inputs)
+            np.testing.assert_allclose(first.xy, locked.xy)
+
+        inputs["step"] = 31
+        inputs["robot_xy"] = np.array([1.19, 0.0])  # 0.81m from the goal
+        still_locked = policy.propose_subgoal(**inputs)
 
         self.assertEqual(detector.calls, 1)
-        np.testing.assert_allclose(first.xy, second.xy)
+        np.testing.assert_allclose(first.xy, still_locked.xy)
+
+        inputs["step"] = 32
+        inputs["robot_xy"] = np.array([1.21, 0.0])  # 0.79m from the goal
+        policy.propose_subgoal(**inputs)
+
+        self.assertEqual(detector.calls, 2)
+        self.assertFalse(policy.has_active_subgoal(0))
 
     def test_unavailable_detector_returns_none_for_legacy_fallback(self):
         policy = SemanticStairFrontierPolicy(
             UnavailableDetector(), scorer=None, num_envs=1
         )
         self.assertIsNone(policy.propose_subgoal(**self.make_inputs()))
+
+    def test_empty_detection_is_rate_limited_during_legacy_fallback(self):
+        detector = FakeDetector([])
+        policy = SemanticStairFrontierPolicy(
+            detector,
+            scorer=None,
+            num_envs=1,
+            config=StairFrontierConfig(replan_interval=4),
+        )
+        inputs = self.make_inputs()
+
+        for step in range(10, 14):
+            inputs["step"] = step
+            self.assertIsNone(policy.propose_subgoal(**inputs))
+        self.assertEqual(detector.calls, 1)
+
+        inputs["step"] = 14
+        self.assertIsNone(policy.propose_subgoal(**inputs))
+        self.assertEqual(detector.calls, 2)
 
     def test_filters_behind_and_out_of_range_candidates(self):
         detector = FakeDetector(

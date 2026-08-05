@@ -74,7 +74,11 @@ class StairFrontierConfig:
     stair_support_floor: float = 0.35
     world_stair_radius_px: int = 12
     hysteresis_ratio: float = 1.2
-    goal_reached_distance: float = 0.25
+    # A selected OpenFrontier subgoal is locked until the robot enters this
+    # radius.  PointNav commonly needs more than a few discrete actions to
+    # cover an open staircase, so replanning on a short step interval makes
+    # the goal drift with the camera instead of remaining a world-space target.
+    goal_reached_distance: float = 0.8
     stuck_distance_epsilon: float = 0.05
     stuck_steps: int = 8
 
@@ -113,6 +117,9 @@ class StairFrontierConfig:
             max_relative_heading_deg=number("ASCENT_STAIR_MAX_HEADING_DEG", 125.0, float),
             stair_support_floor=number("ASCENT_STAIR_SUPPORT_FLOOR", 0.35, float),
             hysteresis_ratio=number("ASCENT_STAIR_HYSTERESIS_RATIO", 1.2, float),
+            goal_reached_distance=number(
+                "ASCENT_STAIR_GOAL_REACHED_DISTANCE", 0.8, float
+            ),
             stuck_steps=number("ASCENT_STAIR_STUCK_STEPS", 8, int),
         )
 
@@ -190,6 +197,33 @@ class SemanticStairFrontierPolicy:
 
     def reset(self, env: int) -> None:
         self._states[env] = _EnvironmentState()
+
+    def has_active_subgoal(self, env: int) -> bool:
+        """Whether PointNav is currently following a locked semantic goal."""
+
+        return self._states[env].active is not None
+
+    def active_subgoal_distance(
+        self, env: int, robot_xy: np.ndarray
+    ) -> Optional[float]:
+        """Return distance to the locked goal without running the detector."""
+
+        active = self._states[env].active
+        if active is None:
+            return None
+        robot_xy = np.asarray(robot_xy, dtype=float).reshape(2)
+        return float(np.linalg.norm(active.xy - robot_xy))
+
+    def complete_active_subgoal(self, env: int) -> None:
+        """Release a reached goal while retaining its last debug detection."""
+
+        state = self._states[env]
+        state.active = None
+        # Reaching a goal is an explicit request for the next local segment;
+        # do not apply a previous failed-detection cooldown to it.
+        state.last_replan_step = -10**9
+        state.last_distance = float("inf")
+        state.stagnant_steps = 0
 
     def debug_snapshot(self, env: int) -> Dict[str, object]:
         """Return the latest visual-frontier state without affecting navigation."""
@@ -307,21 +341,26 @@ class SemanticStairFrontierPolicy:
                 state.stagnant_steps += 1
             state.last_distance = active_distance
 
-            reached = active_distance <= self.config.goal_reached_distance
-            stuck = state.stagnant_steps >= self.config.stuck_steps
-            interval_elapsed = step - state.last_replan_step >= self.config.replan_interval
-
-            if active_distance > self.config.max_subgoal_distance * 1.5:
-                # A stale goal from another staircase must not survive a long
-                # period of normal exploration within the same episode.
-                state.active = None
-            elif stuck:
-                state.blocked_goals.append(state.active.xy.copy())
-                state.active = None
-            elif reached:
-                state.active = None
-            elif not reached and not interval_elapsed:
+            if active_distance > self.config.goal_reached_distance:
+                # Keep the selected world-space OpenFrontier point as the
+                # PointNav goal for the whole local segment.  In particular,
+                # do not invoke FrontierNet/VLM merely because the old
+                # replan interval elapsed or progress was temporarily slow.
                 return state.active
+
+            # Reaching the locked point completes this local stair segment.
+            # Detection below may now select the next segment from the fresh
+            # RGB-D observation.
+            state.active = None
+            state.last_replan_step = -10**9
+            state.last_distance = float("inf")
+            state.stagnant_steps = 0
+
+        # Failed/empty detections are also rate limited. Without this guard an
+        # empty FrontierNet result is recomputed every step and the caller's
+        # legacy fallback never gets a chance to accumulate recovery state.
+        if step - state.last_replan_step < self.config.replan_interval:
+            return None
 
         depth = np.asarray(normalized_depth, dtype=np.float32).squeeze()
         if depth.ndim != 2 or depth.size == 0:
@@ -337,6 +376,7 @@ class SemanticStairFrontierPolicy:
             )
         except Exception as exc:  # an external detector must never take down navigation
             LOGGER.warning("Semantic stair frontier detection failed: %s", exc)
+            state.last_replan_step = step
             return state.active
 
         detected_candidates = detection.candidates
@@ -349,6 +389,7 @@ class SemanticStairFrontierPolicy:
             else np.asarray(detection.marked_rgb).copy()
         )
         state.debug_detection_step = step
+        state.last_replan_step = step
         if not detected_candidates:
             return state.active
 
@@ -450,10 +491,14 @@ class SemanticStairFrontierPolicy:
                 )
                 continue
             distance = float(np.linalg.norm(candidate.goal_xy - robot_xy))
-            if not self.config.min_subgoal_distance <= distance <= self.config.max_subgoal_distance:
+            min_navigation_distance = max(
+                self.config.min_subgoal_distance,
+                self.config.goal_reached_distance,
+            )
+            if not min_navigation_distance < distance <= self.config.max_subgoal_distance:
                 candidate.filter_reason = (
                     f"distance {distance:.2f}m outside "
-                    f"[{self.config.min_subgoal_distance:.2f}, "
+                    f"({min_navigation_distance:.2f}, "
                     f"{self.config.max_subgoal_distance:.2f}]m"
                 )
                 continue
