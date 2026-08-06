@@ -1,4 +1,4 @@
-"""Height-based guard for noisy 2D stair-map exit decisions."""
+"""Height-based guards for stair exit and legacy-carrot direction decisions."""
 
 from __future__ import annotations
 
@@ -126,4 +126,237 @@ class StairHeightGuard:
             directional_change=directional_change,
             outside_stable_steps=state.outside_stable_steps,
             height_changing=height_changing,
+        )
+
+
+@dataclass(frozen=True)
+class CarrotHeightDirectionConfig:
+    """Controls height validation for the legacy stair-carrot fallback."""
+
+    probe_forward_steps: int = 4
+    change_threshold: float = 0.03
+    rotate_steps: int = 3
+
+    @classmethod
+    def from_env(cls) -> "CarrotHeightDirectionConfig":
+        def number(name: str, default, cast):
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return cast(raw)
+            except (TypeError, ValueError):
+                LOGGER.warning("Ignoring invalid %s=%r", name, raw)
+                return default
+
+        return cls(
+            probe_forward_steps=max(
+                1,
+                number("ASCENT_CARROT_HEIGHT_PROBE_FORWARD_STEPS", 4, int),
+            ),
+            change_threshold=max(
+                0.0,
+                number("ASCENT_CARROT_HEIGHT_CHANGE_THRESHOLD", 0.03, float),
+            ),
+            rotate_steps=max(
+                1, number("ASCENT_CARROT_DIRECTION_ROTATE_STEPS", 3, int)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CarrotHeightDirectionDecision:
+    should_rotate: bool
+    restart_carrot: bool
+    height_available: bool
+    direction_confirmed: bool
+    signed_height_change: float
+    probe_forward_steps: int
+    completed_rotate_steps: int
+    reason: str
+
+
+@dataclass
+class _CarrotHeightDirectionState:
+    direction: int = 0
+    probe_start_height: float = float("nan")
+    probe_forward_steps: int = 0
+    searching: bool = False
+    completed_rotate_steps: int = 0
+
+
+class CarrotHeightDirectionGuard:
+    """Validate a legacy carrot using the robot's resulting height change.
+
+    A carrot cannot be validated from height before the robot moves.  The
+    guard therefore lets PointNav execute a short forward probe.  If that
+    probe moves vertically in the requested direction, navigation continues.
+    If it moves in the opposite direction or remains vertically flat, the
+    guard requests a consecutive turn sweep and then starts a fresh probe with
+    a newly generated carrot.
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        config: Optional[CarrotHeightDirectionConfig] = None,
+    ) -> None:
+        self.config = config or CarrotHeightDirectionConfig.from_env()
+        self._states = [
+            _CarrotHeightDirectionState() for _ in range(num_envs)
+        ]
+
+    def reset(self, env: int) -> None:
+        self._states[env] = _CarrotHeightDirectionState()
+
+    @staticmethod
+    def _decision(
+        state: _CarrotHeightDirectionState,
+        *,
+        should_rotate: bool,
+        restart_carrot: bool,
+        height_available: bool,
+        direction_confirmed: bool,
+        signed_height_change: float,
+        reason: str,
+    ) -> CarrotHeightDirectionDecision:
+        return CarrotHeightDirectionDecision(
+            should_rotate=should_rotate,
+            restart_carrot=restart_carrot,
+            height_available=height_available,
+            direction_confirmed=direction_confirmed,
+            signed_height_change=signed_height_change,
+            probe_forward_steps=state.probe_forward_steps,
+            completed_rotate_steps=state.completed_rotate_steps,
+            reason=reason,
+        )
+
+    def update(
+        self,
+        *,
+        env: int,
+        height: float,
+        direction: int,
+        previous_action_was_forward: bool,
+        previous_action_was_search_turn: bool,
+    ) -> CarrotHeightDirectionDecision:
+        """Return whether the caller must override PointNav with a turn.
+
+        ``direction`` follows ASCENT: 1 means upstairs and 2 downstairs.
+        Positive ``signed_height_change`` always means progress in the desired
+        direction, regardless of whether the robot is climbing or descending.
+        """
+
+        if not np.isfinite(height) or direction not in (1, 2):
+            self.reset(env)
+            state = self._states[env]
+            return self._decision(
+                state,
+                should_rotate=False,
+                restart_carrot=False,
+                height_available=False,
+                direction_confirmed=False,
+                signed_height_change=0.0,
+                reason="height unavailable; preserving legacy carrot behaviour",
+            )
+
+        state = self._states[env]
+        if state.direction != direction:
+            state = _CarrotHeightDirectionState(
+                direction=direction, probe_start_height=float(height)
+            )
+            self._states[env] = state
+
+        direction_sign = 1.0 if direction == 1 else -1.0
+        signed_height_change = direction_sign * (
+            float(height) - state.probe_start_height
+        )
+
+        if state.searching:
+            if previous_action_was_search_turn:
+                state.completed_rotate_steps += 1
+
+            if state.completed_rotate_steps < self.config.rotate_steps:
+                return self._decision(
+                    state,
+                    should_rotate=True,
+                    restart_carrot=True,
+                    height_available=True,
+                    direction_confirmed=False,
+                    signed_height_change=signed_height_change,
+                    reason="searching for a new stair direction",
+                )
+
+            # A turn sweep has exposed a new view.  Discard the old carrot and
+            # use the current height as the next forward-probe baseline.
+            state.searching = False
+            state.completed_rotate_steps = 0
+            state.probe_forward_steps = 0
+            state.probe_start_height = float(height)
+            return self._decision(
+                state,
+                should_rotate=False,
+                restart_carrot=True,
+                height_available=True,
+                direction_confirmed=False,
+                signed_height_change=0.0,
+                reason="turn sweep complete; probing a newly generated carrot",
+            )
+
+        if not previous_action_was_forward:
+            return self._decision(
+                state,
+                should_rotate=False,
+                restart_carrot=False,
+                height_available=True,
+                direction_confirmed=False,
+                signed_height_change=signed_height_change,
+                reason="waiting for a forward probe",
+            )
+
+        state.probe_forward_steps += 1
+        threshold = self.config.change_threshold
+        if signed_height_change >= threshold:
+            state.probe_start_height = float(height)
+            state.probe_forward_steps = 0
+            return self._decision(
+                state,
+                should_rotate=False,
+                restart_carrot=False,
+                height_available=True,
+                direction_confirmed=True,
+                signed_height_change=signed_height_change,
+                reason="height changed in the requested stair direction",
+            )
+
+        moved_opposite = signed_height_change <= -threshold
+        probe_expired = (
+            state.probe_forward_steps >= self.config.probe_forward_steps
+        )
+        if moved_opposite or probe_expired:
+            state.searching = True
+            state.completed_rotate_steps = 0
+            reason = (
+                "height changed opposite to the requested stair direction"
+                if moved_opposite
+                else "forward probe produced no requested height change"
+            )
+            return self._decision(
+                state,
+                should_rotate=True,
+                restart_carrot=True,
+                height_available=True,
+                direction_confirmed=False,
+                signed_height_change=signed_height_change,
+                reason=reason,
+            )
+
+        return self._decision(
+            state,
+            should_rotate=False,
+            restart_carrot=False,
+            height_available=True,
+            direction_confirmed=False,
+            signed_height_change=signed_height_change,
+            reason="collecting forward-probe height samples",
         )

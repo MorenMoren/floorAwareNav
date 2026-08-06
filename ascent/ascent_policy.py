@@ -31,7 +31,11 @@ from constants import (
 )
 from ascent.llm_planner import Ascent_LLM_Planner
 from ascent.map_controller import Map_Controller
-from ascent.stair_policy import build_semantic_stair_frontier_policy
+from ascent.frontier_progress_guard import ExplorationFrontierProgressGuard
+from ascent.stair_policy import (
+    CarrotHeightDirectionGuard,
+    build_semantic_stair_frontier_policy,
+)
 from ascent.utils import (
     xyz_yaw_pitch_roll_to_tf_matrix,
     check_stairs_in_upper_50_percent,
@@ -204,6 +208,12 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
             device=str(self.device),
             shared_qwen_vlm=self.llm_planner._llm,
         )
+        self._carrot_height_direction_guard = CarrotHeightDirectionGuard(
+            self._num_envs
+        )
+        self._exploration_frontier_progress_guard = (
+            ExplorationFrontierProgressGuard(self._num_envs)
+        )
     def _reset(self, env: int) -> None:
         ## 核心策略状态重置
         self._pointnav_policy[env].reset()
@@ -225,6 +235,8 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
         # 防止之前episode爬楼梯异常退出
         self._pitch_angle[env] = 0
         self._semantic_stair_policy.reset(env)
+        self._carrot_height_direction_guard.reset(env)
+        self._exploration_frontier_progress_guard.reset(env)
 
         ## 目标检测和探索相关状态重置
         # 防止识别正确之后造成误识别
@@ -643,6 +655,7 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
                 # floor-state machine leaves stair traversal so it cannot be
                 # reused by a later staircase in the same episode.
                 self._semantic_stair_policy.reset(env)
+                self._carrot_height_direction_guard.reset(env)
                 if self._pitch_angle[env] > 0:
                     mode = "look_down_back"
                     self._pitch_angle[env] = max(
@@ -744,7 +757,32 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
         根据当前观测和环境状态执行探索行为。
         """
         initial_frontiers = self._observations_cache[env]["frontier_sensor"]
-        frontiers = [f for f in initial_frontiers if tuple(f) not in self._map_controller._obstacle_map[env]._disabled_frontiers]
+        floor_index = self._map_controller._cur_floor_index[env]
+        frontiers = np.asarray(
+            [
+                frontier
+                for frontier in initial_frontiers
+                if tuple(frontier)
+                not in self._map_controller._obstacle_map[env]._disabled_frontiers
+            ]
+        ).reshape(-1, 2)
+        for frontier in frontiers:
+            if self._exploration_frontier_progress_guard.is_blocked(
+                env=env,
+                floor_index=floor_index,
+                frontier=frontier,
+            ):
+                # Mirror spatially rejected regenerated points into the legacy
+                # exact-coordinate set so they are also hidden in map debug
+                # visualization and rejected by older planner checks.
+                self._map_controller._obstacle_map[env]._disabled_frontiers.add(
+                    tuple(frontier)
+                )
+        frontiers = self._exploration_frontier_progress_guard.filter_blocked(
+            env=env,
+            floor_index=floor_index,
+            frontiers=frontiers,
+        )
 
         # 场景一：当前楼层没有有效 Frontier (包括初始为全零或列表为空的情况)
         if np.array_equal(frontiers, np.zeros((1, 2))) or len(frontiers) == 0:
@@ -796,6 +834,52 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
             
             # 执行点导航到最佳 Frontier
             self.cur_frontier[env] = best_frontier
+            frontier_progress = self._exploration_frontier_progress_guard.update(
+                env=env,
+                floor_index=floor_index,
+                robot_xy=self._observations_cache[env]["robot_xy"],
+                frontier=best_frontier,
+            )
+            if frontier_progress.unreachable:
+                obstacle_map = self._map_controller._obstacle_map[env]
+                obstacle_map._disabled_frontiers.add(tuple(best_frontier))
+                # A force-frontier selected before the region was declared
+                # unreachable must not survive into the next planning step.
+                if self._exploration_frontier_progress_guard.is_blocked(
+                    env=env,
+                    floor_index=floor_index,
+                    frontier=self.llm_planner._force_frontier[env],
+                ):
+                    self.llm_planner._force_frontier[env] = np.zeros(2)
+                self._pointnav_policy[env].reset()
+                self._last_goal[env] = np.zeros(2)
+                self.cur_frontier[env] = np.array([])
+                print(
+                    "Exploration frontier marked unreachable: "
+                    f"selected={best_frontier}, "
+                    f"region_anchor={frontier_progress.target_anchor}, "
+                    f"current_distance={frontier_progress.current_distance:.2f}m, "
+                    f"best_distance={frontier_progress.best_distance:.2f}m, "
+                    "stalled_selections="
+                    f"{frontier_progress.stalled_selections}/"
+                    f"{self._exploration_frontier_progress_guard.config.max_stalled_selections}. "
+                    "Blocking nearby regenerated frontiers and replanning."
+                )
+                return get_action_tensor(TURN_RIGHT, device=masks.device)
+
+            if (
+                frontier_progress.stalled_selections == 1
+                or frontier_progress.stalled_selections % 5 == 0
+            ):
+                print(
+                    "Exploration frontier progress: "
+                    f"region_anchor={frontier_progress.target_anchor}, "
+                    f"current_distance={frontier_progress.current_distance:.2f}m, "
+                    f"best_distance={frontier_progress.best_distance:.2f}m, "
+                    "stalled_selections="
+                    f"{frontier_progress.stalled_selections}/"
+                    f"{self._exploration_frontier_progress_guard.config.max_stalled_selections}."
+                )
             pointnav_action = self._pointnav(observations, self.cur_frontier[env], stop=False, env=env, stop_radius=self._pointnav_stop_radius)
             
             # 如果点导航动作是停止（0），则强制前进（1），以避免卡死
@@ -1126,6 +1210,7 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
 
         # 阶段1: 接近楼梯质心 (如果尚未到达)
         if not self._map_controller._reach_stair_centroid[env]:
+            self._carrot_height_direction_guard.reset(env)
             stair_centroid_point = target_stair_frontier[0] # 楼梯的质心点
             current_distance = float(np.linalg.norm(stair_centroid_point - robot_xy))
             distance_change = abs(self._last_frontier_distance[env] - current_distance)
@@ -1291,6 +1376,10 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
                     print("Semantic stair candidates: none; using legacy carrot")
 
             if semantic_subgoal is not None:
+                # Semantic targets have their own VLM direction validation and
+                # locked-goal lifecycle.  Height probing applies only to the
+                # legacy depth-carrot fallback.
+                self._carrot_height_direction_guard.reset(env)
                 current_target_point_xy = semantic_subgoal.xy
                 current_target_point_px = self._map_controller._obstacle_map[env]._xy_to_px(
                     np.atleast_2d(current_target_point_xy)
@@ -1372,6 +1461,65 @@ class Ascent_Policy(HabitatMixin, ITMPolicyV2):
                     if self._map_controller._climb_stair_flag[env] == 1
                     else self._map_controller._obstacle_map[env]._down_stair_end
                 )
+
+                previous_action = (
+                    self.history_action[env][-1]
+                    if self.history_action[env]
+                    else None
+                )
+                carrot_height_decision = (
+                    self._carrot_height_direction_guard.update(
+                        env=env,
+                        height=self._observations_cache[env]["robot_height"],
+                        direction=self._map_controller._climb_stair_flag[env],
+                        previous_action_was_forward=(
+                            previous_action == MOVE_FORWARD
+                        ),
+                        previous_action_was_search_turn=(
+                            previous_action == TURN_RIGHT
+                        ),
+                    )
+                )
+
+                if carrot_height_decision.restart_carrot:
+                    self._map_controller._carrot_goal_xy[env] = []
+                    self._map_controller._last_carrot_xy[env] = []
+                    self._map_controller._last_carrot_px[env] = []
+                    self._map_controller._obstacle_map[env]._carrot_goal_px = np.array([])
+
+                if carrot_height_decision.should_rotate:
+                    # Intentional direction search is not a navigation stall;
+                    # do not let the legacy timeout terminate stair mode.
+                    self._map_controller._obstacle_map[env]._climb_stair_paused_step = 0
+                    self._map_controller._obstacle_map[env]._disable_end = False
+                    print(
+                        "Legacy stair carrot rejected by height: "
+                        f"reason={carrot_height_decision.reason}, "
+                        "desired_direction="
+                        f"{'up' if self._map_controller._climb_stair_flag[env] == 1 else 'down'}, "
+                        "signed_height_change="
+                        f"{carrot_height_decision.signed_height_change:.3f}m, "
+                        "forward_probe_steps="
+                        f"{carrot_height_decision.probe_forward_steps}/"
+                        f"{self._carrot_height_direction_guard.config.probe_forward_steps}, "
+                        "rotate_steps="
+                        f"{carrot_height_decision.completed_rotate_steps}/"
+                        f"{self._carrot_height_direction_guard.config.rotate_steps}; "
+                        "turning right."
+                    )
+                    return get_action_tensor(TURN_RIGHT, device=masks.device)
+
+                if carrot_height_decision.direction_confirmed:
+                    print(
+                        "Legacy stair carrot height direction confirmed: "
+                        f"signed_height_change="
+                        f"{carrot_height_decision.signed_height_change:.3f}m."
+                    )
+                elif carrot_height_decision.restart_carrot:
+                    print(
+                        "Legacy stair carrot direction-search turn sweep "
+                        "completed; evaluating a new carrot."
+                    )
 
                 # 第一次或接近楼梯终点时重置胡萝卜目标点
                 if (len(self._map_controller._last_carrot_xy[env]) == 0 or this_stair_end_px.size == 0 or

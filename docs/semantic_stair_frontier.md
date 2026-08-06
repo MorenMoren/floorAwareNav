@@ -106,6 +106,9 @@ export ASCENT_STAIR_HYSTERESIS_RATIO=1.2
 export ASCENT_STAIR_HEIGHT_WINDOW_STEPS=5
 export ASCENT_STAIR_HEIGHT_CHANGE_THRESHOLD=0.03
 export ASCENT_STAIR_EXIT_STABLE_STEPS=6
+export ASCENT_CARROT_HEIGHT_PROBE_FORWARD_STEPS=4
+export ASCENT_CARROT_HEIGHT_CHANGE_THRESHOLD=0.03
+export ASCENT_CARROT_DIRECTION_ROTATE_STEPS=3
 ```
 
 `ASCENT_STAIR_REPLAN_INTERVAL` and `ASCENT_STAIR_STUCK_STEPS` are retained in
@@ -122,6 +125,16 @@ Exit is confirmed only after the directional height change drops below 3 cm
 over the five-step window and the map remains outside for six stable steps.
 With a legacy 2D GPS configuration, this guard is unavailable and behavior
 falls back to the original map-only decision.
+
+The same 3D GPS height also validates the legacy carrot fallback. After a
+carrot is selected, PointNav is allowed a short forward probe. Upstairs must
+produce a positive height change and downstairs a negative one. Opposite
+motion rejects the carrot immediately; less than 3 cm of directional height
+change after four forward actions also rejects it. The controller then clears
+the stale carrot, turns right for three consecutive actions, regenerates a
+carrot from the new view, and starts a new probe. Intentional search turns do
+not increment the stair-stall timeout. A locked semantic FrontierNet subgoal
+is not affected because its direction has already been validated by the VLM.
 
 Candidates scored by the VLM below
 `ASCENT_STAIR_MIN_SEMANTIC_PROBABILITY` are rejected. If a fresh FrontierNet
