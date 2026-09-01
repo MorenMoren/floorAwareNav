@@ -6,7 +6,10 @@ import os
 from ascent.mapping.object_point_cloud_map import ObjectPointCloudMap
 from ascent.mapping.obstacle_map import ObstacleMap
 from ascent.mapping.value_map import ValueMap
-from ascent.stair_policy.height_guard import StairHeightGuard
+from ascent.stair_policy.height_guard import (
+    PassiveStairEntryHeightGuard,
+    StairHeightGuard,
+)
 from constants import (
     PROMPT_SEPARATOR,
 )
@@ -130,8 +133,16 @@ class Map_Controller:
         self.cur_dis_to_goal: List[float] = [np.inf] * self._num_envs
         self._passive_up_stair_steps: List[int] = [0] * self._num_envs
         self._passive_down_stair_steps: List[int] = [0] * self._num_envs
-        self.PASSIVE_STAIR_DETECTION_THRESHOLD = 3  # 连续3步在楼梯区域内即触发
         self._stair_height_guard = StairHeightGuard(self._num_envs)
+        self._passive_stair_entry_guard = PassiveStairEntryHeightGuard(
+            self._num_envs
+        )
+        self.PASSIVE_STAIR_DETECTION_THRESHOLD = (
+            self._passive_stair_entry_guard.config.min_map_steps
+        )
+        self._reported_passive_height_unavailable: List[bool] = [
+            False
+        ] * self._num_envs
     def reset(self, env: int) -> None:
         self._cur_floor_index[env] = 0
         # 确保只保留第一层的地图实例并重置它们
@@ -181,6 +192,8 @@ class Map_Controller:
         self._passive_up_stair_steps[env] = 0
         self._passive_down_stair_steps[env] = 0
         self._stair_height_guard.reset(env)
+        self._passive_stair_entry_guard.reset(env)
+        self._reported_passive_height_unavailable[env] = False
     def is_robot_in_stair_map_fast(self, env: int, robot_px:np.ndarray, stair_map: np.ndarray):
         """
         高效判断以机器人质心为圆心、指定半径的圆是否覆盖 stair_map 中值为 1 的点。
@@ -533,7 +546,13 @@ class Map_Controller:
             # ✅ 新增：被动检测楼梯（仅在非爬楼梯状态时）
             if self._climb_stair_over[env] and self._climb_stair_flag[env] == 0:
                 self._stair_height_guard.reset(env)
-                self._detect_passive_stair_entry(env, robot_px)
+                self._detect_passive_stair_entry(
+                    env, robot_px, robot_height
+                )
+            else:
+                self._passive_stair_entry_guard.reset(env)
+                self._passive_up_stair_steps[env] = 0
+                self._passive_down_stair_steps[env] = 0
             
             # 原有的爬楼梯状态处理
             if not self._climb_stair_over[env]:
@@ -682,52 +701,110 @@ class Map_Controller:
             # 标记新楼层已有上楼梯
             self._obstacle_map[env]._has_up_stair = True
 
-    def _detect_passive_stair_entry(self, env: int, robot_px: np.ndarray):
+    def _detect_passive_stair_entry(
+        self,
+        env: int,
+        robot_px: np.ndarray,
+        robot_height: float,
+    ):
         """
         检测机器人是否被动进入楼梯区域。
-        如果机器人在楼梯区域内停留超过阈值步数，自动触发爬楼梯模式。
+        二维楼梯地图命中后，还必须观察到与楼梯方向一致的高度变化。
         """
-        # 检查上楼梯
-        if self._obstacle_map[env]._has_up_stair and len(self._obstacle_map[env]._up_stair_frontiers) > 0:
+        obstacle_map = self._obstacle_map[env]
+        next_floor_idx = self._cur_floor_index[env] + 1
+        prev_floor_idx = self._cur_floor_index[env] - 1
+        up_floor_unexplored = (
+            next_floor_idx >= len(self._obstacle_map_list[env])
+            or not self._obstacle_map_list[env][next_floor_idx]._this_floor_explored
+        )
+        down_floor_unexplored = (
+            prev_floor_idx < 0
+            or not self._obstacle_map_list[env][prev_floor_idx]._this_floor_explored
+        )
+
+        up_eligible = (
+            obstacle_map._has_up_stair
+            and len(obstacle_map._up_stair_frontiers) > 0
+            and up_floor_unexplored
+        )
+        down_eligible = (
+            obstacle_map._has_down_stair
+            and len(obstacle_map._down_stair_frontiers) > 0
+            and down_floor_unexplored
+        )
+        in_up_stair = False
+        in_down_stair = False
+        if up_eligible:
             in_up_stair, _ = self.is_robot_in_stair_map_fast(
-                env, robot_px, self._obstacle_map[env]._up_stair_map
+                env, robot_px, obstacle_map._up_stair_map
             )
-            
-            if in_up_stair:
-                self._passive_up_stair_steps[env] += 1
-                self._passive_down_stair_steps[env] = 0  # 重置下楼梯计数
-                
-                if self._passive_up_stair_steps[env] >= self.PASSIVE_STAIR_DETECTION_THRESHOLD:
-                    # 检查是否已经探索过上层
-                    next_floor_idx = self._cur_floor_index[env] + 1
-                    if next_floor_idx >= len(self._obstacle_map_list[env]) or \
-                       not self._obstacle_map_list[env][next_floor_idx]._this_floor_explored:
-                        print(f"Environment {env}: Passive upstairs detection triggered!")
-                        self._trigger_stair_climbing(env, climb_direction=1, robot_px=robot_px)
-                    self._passive_up_stair_steps[env] = 0
-            else:
-                self._passive_up_stair_steps[env] = 0
-        
-        # 检查下楼梯
-        if self._obstacle_map[env]._has_down_stair and len(self._obstacle_map[env]._down_stair_frontiers) > 0:
+        if down_eligible:
             in_down_stair, _ = self.is_robot_in_stair_map_fast(
-                env, robot_px, self._obstacle_map[env]._down_stair_map
+                env, robot_px, obstacle_map._down_stair_map
             )
-            
-            if in_down_stair:
-                self._passive_down_stair_steps[env] += 1
-                self._passive_up_stair_steps[env] = 0  # 重置上楼梯计数
-                
-                if self._passive_down_stair_steps[env] >= self.PASSIVE_STAIR_DETECTION_THRESHOLD:
-                    # 检查是否已经探索过下层
-                    prev_floor_idx = self._cur_floor_index[env] - 1
-                    if prev_floor_idx < 0 or \
-                       not self._obstacle_map_list[env][prev_floor_idx]._this_floor_explored:
-                        print(f"Environment {env}: Passive downstairs detection triggered!")
-                        self._trigger_stair_climbing(env, climb_direction=2, robot_px=robot_px)
-                    self._passive_down_stair_steps[env] = 0
-            else:
-                self._passive_down_stair_steps[env] = 0
+
+        up_decision = self._passive_stair_entry_guard.update(
+            env=env,
+            height=robot_height,
+            direction=1,
+            in_stair_map=in_up_stair,
+        )
+        down_decision = self._passive_stair_entry_guard.update(
+            env=env,
+            height=robot_height,
+            direction=2,
+            in_stair_map=in_down_stair,
+        )
+        self._passive_up_stair_steps[env] = up_decision.map_steps
+        self._passive_down_stair_steps[env] = down_decision.map_steps
+
+        if (
+            (in_up_stair or in_down_stair)
+            and not np.isfinite(robot_height)
+            and not self._reported_passive_height_unavailable[env]
+        ):
+            print(
+                f"Environment {env}: Passive stair entry ignored because "
+                "3D GPS height is unavailable."
+            )
+            self._reported_passive_height_unavailable[env] = True
+        elif np.isfinite(robot_height):
+            self._reported_passive_height_unavailable[env] = False
+
+        for direction, in_stair, decision in (
+            (1, in_up_stair, up_decision),
+            (2, in_down_stair, down_decision),
+        ):
+            if not in_stair:
+                continue
+            direction_name = "up" if direction == 1 else "down"
+            if decision.map_steps == 1 or decision.map_steps % 5 == 0:
+                height_text = (
+                    f"{robot_height:.3f}m"
+                    if decision.height_available
+                    else "unavailable"
+                )
+                print(
+                    "Passive stair entry candidate: "
+                    f"direction={direction_name}, height={height_text}, "
+                    f"map_steps={decision.map_steps}/"
+                    f"{self._passive_stair_entry_guard.config.min_map_steps}, "
+                    "directional_height_change="
+                    f"{decision.directional_change:.3f}/"
+                    f"{self._passive_stair_entry_guard.config.change_threshold:.3f}m, "
+                    f"confirmed={decision.confirmed}."
+                )
+
+            if decision.confirmed:
+                print(
+                    f"Environment {env}: Passive {direction_name}stairs "
+                    "confirmed by map overlap and directional height change!"
+                )
+                self._trigger_stair_climbing(
+                    env, climb_direction=direction, robot_px=robot_px
+                )
+                return
     
     def _trigger_stair_climbing(self, env: int, climb_direction: int, robot_px: np.ndarray):
         """
@@ -739,6 +816,7 @@ class Map_Controller:
         self._reach_stair_centroid[env] = False  # 被动进入时，可能还未到达质心
         self._get_close_to_stair_step[env] = 0
         self._stair_height_guard.reset(env)
+        self._passive_stair_entry_guard.reset(env)
         
         if climb_direction == 1:
             self._obstacle_map[env]._up_stair_start = robot_px[0].copy()

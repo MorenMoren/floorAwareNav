@@ -20,7 +20,7 @@ class FrontierProgressConfig:
     association_radius: float = 0.6
     blocked_radius: float = 0.75
     min_progress: float = 0.15
-    max_stalled_selections: int = 20
+    max_stalled_selections: int = 35
 
     @classmethod
     def from_env(cls) -> "FrontierProgressConfig":

@@ -1,0 +1,19 @@
+        "val/00802-wcojb4TFT35/*.basis.scene_instance.json",    85.86%	85.86%（frontiernet）
+        "val/00813-svBbv1Pavdk/*.basis.scene_instance.json",    77.78%	single_floor
+        "val/00814-p53SfW6mjZe/*.basis.scene_instance.json",    69.70%	70.70%（frontiernet_false_positive）
+        "val/00820-mL8ThkuaVTM/*.basis.scene_instance.json",    51.52%	58.58%（frontiernet）
+        "val/00824-Dd4bFSTQ8gi/*.basis.scene_instance.json",    67.68%	single_floor
+        "val/00829-QaLdnwvtxbs/*.basis.scene_instance.json",    92.93%	single_floor
+        "val/00832-qyAac8rV8Zk/*.basis.scene_instance.json",    37.37%	50.50%（frontiernet）
+        "val/00835-q3zU7Yy5E5s/*.basis.scene_instance.json",    60.61%	61.61%（frontiernet）
+        "val/00839-zt1RVoi7PcG/*.basis.scene_instance.json",    60.50%	62.18%（frontiernet 119 episodes）
+        "val/00843-DYehNKdT76V/*.basis.scene_instance.json",    66.67%	68.68%（frontiernet）
+        "val/00848-ziup5kvtCCR/*.basis.scene_instance.json",    79.80%	single_floor
+        "val/00853-5cdEh9F2hJL/*.basis.scene_instance.json",    62.00%	65.65%（frontiernet）
+        "val/00873-bxsVRursffK/*.basis.scene_instance.json",    56.57%	67.68%（frontiernet）
+        "val/00876-mv2HUxq3B53/*.basis.scene_instance.json",    75.76%	signle_floor
+        "val/00877-4ok3usBNeis/*.basis.scene_instance.json",    90.91%  single_floor
+        "val/00878-XB4GS9ShBRE/*.basis.scene_instance.json",    66.66%  71.71%（frontiernet）
+        "val/00880-Nfvxx8J5NCo/*.basis.scene_instance.json",    84.84%	single_floor
+        "val/00890-6s7QHgap2fW/*.basis.scene_instance.json",    34.34%  37.37%（frontiernet）
+        "val/00891-cvZr5TUy5C5/*.basis.scene_instance.json"     42.42%	44.44%（frontiernet huge_scene）

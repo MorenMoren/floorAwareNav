@@ -12,12 +12,18 @@ from .height_guard import (
     CarrotHeightDirectionConfig,
     CarrotHeightDirectionDecision,
     CarrotHeightDirectionGuard,
+    PassiveStairEntryConfig,
+    PassiveStairEntryDecision,
+    PassiveStairEntryHeightGuard,
 )
 
 __all__ = [
     "CarrotHeightDirectionConfig",
     "CarrotHeightDirectionDecision",
     "CarrotHeightDirectionGuard",
+    "PassiveStairEntryConfig",
+    "PassiveStairEntryDecision",
+    "PassiveStairEntryHeightGuard",
     "SemanticStairFrontierPolicy",
     "StairDirection",
     "StairFrontierCandidate",

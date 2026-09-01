@@ -43,7 +43,7 @@
 2. FrontierNet 从当前 RGB-D 视图检测视觉 frontier。
 3. 深度和相机位姿将候选锚定为 episodic 世界坐标。
 4. 候选标记为 A、B、C，并生成 Set-of-Marks 图像。
-5. 复用 ASCENT 已有的多模态 `Qwen/Qwen3.6-27B`，将原“寻找目标物体”语义替换为：
+5. 复用 ASCENT 已有的多模态 `Qwen/Qwen3.6-35B-A3B`，将原“寻找目标物体”语义替换为：
    - 上楼时选择继续向上的可通行台阶或平台方向；
    - 下楼时选择继续向下的可通行台阶或平台方向；
    - 排除墙、栏杆、侧向走廊、反方向楼梯和不可通行区域。
@@ -135,9 +135,17 @@ FrontierNet 候选已加入 debug 视频：
 
 这样减少了 PointNav 因楼梯画面占比过高而长期转向、不直接导航到锁定目标的问题。
 
-### 3.7 基于高度的楼梯状态保持
+### 3.7 基于高度的被动进入与楼梯状态保持
 
 HM3D 和 MP3D eval 配置已将 episodic GPS 设置为三维。高度只用于楼梯状态判断，不加入 ASCENT 原有的每层局部地图投影，以避免上层点云被固定高度过滤器丢弃。
+
+开放楼梯可能把上方的大块楼梯区域投影到当前二维地图，使位于楼梯下方、但高度完全不变的机器人误触发被动爬楼。被动进入现在需要双重证据：
+
+- 机器人连续命中二维上楼或下楼区域至少 3 step。
+- 上楼候选在最近高度窗口中至少升高 `0.05m`；下楼候选至少降低 `0.05m`。
+- 稳定高度或反方向高度变化不会触发被动 `climb_stair`。
+- 离开对应楼梯地图后清空该方向的高度基线。
+- 没有三维 GPS 时禁用被动楼梯触发，但主动导航到已知楼梯的流程不受影响。
 
 当二维 obstacle map 暂时认为机器人离开楼梯区域时：
 
@@ -214,6 +222,7 @@ TypeError: float() argument must be a string or a number, not 'NoneType'
 | BENCH-005 | legacy carrot 指向错误上/下楼方向 | 已增加高度方向探测和旋转搜索 |
 | BENCH-006 | FrontierNet 点随机器人位置变化 | 已改为 episodic 世界坐标锁定，并修复 OpenCV/ASCENT 坐标基 |
 | BENCH-007 | 评测信息含 `None` 导致 episode 汇总崩溃 | 已递归过滤非标量调试字段 |
+| BENCH-008 | 开放楼梯投影覆盖下方地面，误触发被动爬楼 | 已要求二维区域命中和正确方向高度变化同时成立 |
 
 ## 5. 当前已知限制
 
@@ -263,6 +272,11 @@ export ASCENT_STAIR_HEIGHT_WINDOW_STEPS=5
 export ASCENT_STAIR_HEIGHT_CHANGE_THRESHOLD=0.03
 export ASCENT_STAIR_EXIT_STABLE_STEPS=6
 
+# 被动进入楼梯的高度确认
+export ASCENT_PASSIVE_STAIR_HEIGHT_WINDOW_STEPS=6
+export ASCENT_PASSIVE_STAIR_MIN_MAP_STEPS=3
+export ASCENT_PASSIVE_STAIR_HEIGHT_CHANGE_THRESHOLD=0.05
+
 # legacy carrot 方向验证
 export ASCENT_CARROT_HEIGHT_PROBE_FORWARD_STEPS=4
 export ASCENT_CARROT_HEIGHT_CHANGE_THRESHOLD=0.03
@@ -275,7 +289,7 @@ export ASCENT_FRONTIER_MIN_PROGRESS=0.15
 export ASCENT_FRONTIER_MAX_STALLED_SELECTIONS=20
 
 # 现有多模态 Qwen 服务
-export ASCENT_QWEN_MODEL=Qwen/Qwen3.6-27B
+export ASCENT_QWEN_MODEL=Qwen/Qwen3.6-35B-A3B
 export ASCENT_QWEN_BASE_URL=http://your-qwen-server/v1
 export ASCENT_QWEN_API_KEY=EMPTY
 ```

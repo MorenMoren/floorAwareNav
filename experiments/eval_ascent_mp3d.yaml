@@ -27,7 +27,9 @@ habitat:
         area_thresh: 1.5
       gps_sensor:
         dimensionality: 3
-
+    measurements:
+      success:
+        success_distance: 0.6
 habitat_baselines:
   evaluate: True
   eval_ckpt_path_dir: dummy_policy.pth

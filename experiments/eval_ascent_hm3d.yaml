@@ -27,10 +27,14 @@ habitat:
         area_thresh: 1.5
       gps_sensor:
         dimensionality: 3
-    #type: ObjectNav-v2
+    # HM3D v2 is the episode-dataset version. Habitat-Lab registers the
+    # ObjectNav task itself under ObjectNav-v1 for both HM3D v1 and v2.
+    type: ObjectNav-v1
     measurements:
       success:
         success_distance: 0.6
+  dataset:
+    data_path: data/datasets/objectnav_hm3d_v2/{split}/{split}.json.gz
   # simulator:
   #   SCENE_DATASET: "DATA/HM3D/scene_datasets/hm3d_v0.2/hm3d/hm3d_annotated_basis.scene_dataset_config.json"
   # SUCCESS:
@@ -44,7 +48,7 @@ habitat_baselines:
   verbose: false
   torch_gpu_id: 0
   tensorboard_dir: "debug/tb_hm3d_debug"
-  video_dir: "debug/video_hm3d_debug_linea_v6"              #v3_fuse_new_stair   #v4_no_fuse_new_stair #v5_map_update to match the stair climbing #v6 more_num_env
+  video_dir: "debug/video_hm3dv2_debug"              #v3_fuse_new_stair   #v4_no_fuse_new_stair #v5_map_update to match the stair climbing #v6 more_num_env
   test_episode_count: -1
   checkpoint_folder: "debug/"
   trainer_name: "ascent"

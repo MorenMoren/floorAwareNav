@@ -130,6 +130,132 @@ class StairHeightGuard:
 
 
 @dataclass(frozen=True)
+class PassiveStairEntryConfig:
+    """Evidence required before a 2D stair-map overlap triggers climbing."""
+
+    window_steps: int = 6
+    min_map_steps: int = 3
+    change_threshold: float = 0.05
+
+    @classmethod
+    def from_env(cls) -> "PassiveStairEntryConfig":
+        def number(name: str, default, cast):
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return cast(raw)
+            except (TypeError, ValueError):
+                LOGGER.warning("Ignoring invalid %s=%r", name, raw)
+                return default
+
+        return cls(
+            window_steps=max(
+                2, number("ASCENT_PASSIVE_STAIR_HEIGHT_WINDOW_STEPS", 6, int)
+            ),
+            min_map_steps=max(
+                1, number("ASCENT_PASSIVE_STAIR_MIN_MAP_STEPS", 3, int)
+            ),
+            change_threshold=max(
+                0.0,
+                number(
+                    "ASCENT_PASSIVE_STAIR_HEIGHT_CHANGE_THRESHOLD", 0.05, float
+                ),
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PassiveStairEntryDecision:
+    confirmed: bool
+    height_available: bool
+    directional_change: float
+    map_steps: int
+
+
+@dataclass
+class _PassiveEntryState:
+    history: List[float] = field(default_factory=list)
+    map_steps: int = 0
+
+
+class PassiveStairEntryHeightGuard:
+    """Require vertical motion before passively entering stair mode.
+
+    Open stair geometry can project onto the floor below it, making a robot
+    standing underneath appear inside the 2D stair map. A map hit is therefore
+    treated only as a candidate; upstairs requires rising height and downstairs
+    requires falling height over the recent in-map observation window.
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        config: Optional[PassiveStairEntryConfig] = None,
+    ) -> None:
+        self.config = config or PassiveStairEntryConfig.from_env()
+        self._states = [
+            {1: _PassiveEntryState(), 2: _PassiveEntryState()}
+            for _ in range(num_envs)
+        ]
+
+    def reset(self, env: int, direction: Optional[int] = None) -> None:
+        if direction in (1, 2):
+            self._states[env][direction] = _PassiveEntryState()
+        else:
+            self._states[env] = {
+                1: _PassiveEntryState(),
+                2: _PassiveEntryState(),
+            }
+
+    def update(
+        self,
+        *,
+        env: int,
+        height: float,
+        direction: int,
+        in_stair_map: bool,
+    ) -> PassiveStairEntryDecision:
+        if direction not in (1, 2):
+            return PassiveStairEntryDecision(False, False, 0.0, 0)
+
+        if not in_stair_map:
+            self.reset(env, direction)
+            return PassiveStairEntryDecision(
+                False, bool(np.isfinite(height)), 0.0, 0
+            )
+
+        if not np.isfinite(height):
+            # Passive entry is intentionally disabled without 3D GPS. Falling
+            # back to map-only triggering would reintroduce the false positive
+            # this guard is designed to prevent.
+            self.reset(env, direction)
+            return PassiveStairEntryDecision(False, False, 0.0, 0)
+
+        state = self._states[env][direction]
+        state.map_steps += 1
+        state.history.append(float(height))
+        if len(state.history) > self.config.window_steps:
+            del state.history[: len(state.history) - self.config.window_steps]
+
+        if direction == 1:
+            directional_change = float(state.history[-1] - min(state.history))
+        else:
+            directional_change = float(max(state.history) - state.history[-1])
+        directional_change = max(0.0, directional_change)
+        confirmed = (
+            state.map_steps >= self.config.min_map_steps
+            and directional_change >= self.config.change_threshold
+        )
+        return PassiveStairEntryDecision(
+            confirmed=confirmed,
+            height_available=True,
+            directional_change=directional_change,
+            map_steps=state.map_steps,
+        )
+
+
+@dataclass(frozen=True)
 class CarrotHeightDirectionConfig:
     """Controls height validation for the legacy stair-carrot fallback."""
 

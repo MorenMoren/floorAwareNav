@@ -5,6 +5,8 @@ import numpy as np
 from ascent.stair_policy.height_guard import (
     CarrotHeightDirectionConfig,
     CarrotHeightDirectionGuard,
+    PassiveStairEntryConfig,
+    PassiveStairEntryHeightGuard,
     StairHeightGuard,
     StairHeightGuardConfig,
 )
@@ -74,6 +76,82 @@ class StairHeightGuardTest(unittest.TestCase):
 
         self.assertTrue(decision.allow_map_exit)
         self.assertFalse(decision.height_available)
+
+
+class PassiveStairEntryHeightGuardTest(unittest.TestCase):
+    def make_guard(self):
+        return PassiveStairEntryHeightGuard(
+            num_envs=1,
+            config=PassiveStairEntryConfig(
+                window_steps=5,
+                min_map_steps=3,
+                change_threshold=0.05,
+            ),
+        )
+
+    @staticmethod
+    def update(guard, height, direction=1, in_map=True):
+        return guard.update(
+            env=0,
+            height=height,
+            direction=direction,
+            in_stair_map=in_map,
+        )
+
+    def test_stable_height_under_open_stairs_does_not_trigger(self):
+        guard = self.make_guard()
+        decisions = [self.update(guard, 0.0) for _ in range(10)]
+
+        self.assertFalse(any(decision.confirmed for decision in decisions))
+        self.assertEqual(decisions[-1].directional_change, 0.0)
+
+    def test_upstairs_requires_map_dwell_and_rising_height(self):
+        guard = self.make_guard()
+        first = self.update(guard, 0.00, direction=1)
+        second = self.update(guard, 0.03, direction=1)
+        third = self.update(guard, 0.07, direction=1)
+
+        self.assertFalse(first.confirmed)
+        self.assertFalse(second.confirmed)
+        self.assertTrue(third.confirmed)
+        self.assertAlmostEqual(third.directional_change, 0.07)
+
+    def test_downstairs_requires_falling_height(self):
+        guard = self.make_guard()
+        self.update(guard, 1.00, direction=2)
+        self.update(guard, 0.97, direction=2)
+        decision = self.update(guard, 0.93, direction=2)
+
+        self.assertTrue(decision.confirmed)
+        self.assertAlmostEqual(decision.directional_change, 0.07)
+
+    def test_wrong_height_direction_does_not_trigger(self):
+        guard = self.make_guard()
+        decisions = [
+            self.update(guard, height, direction=1)
+            for height in (1.0, 0.96, 0.92, 0.88)
+        ]
+
+        self.assertFalse(any(decision.confirmed for decision in decisions))
+
+    def test_leaving_map_resets_height_baseline(self):
+        guard = self.make_guard()
+        self.update(guard, 0.00)
+        self.update(guard, 0.04)
+        outside = self.update(guard, 0.04, in_map=False)
+        reentered = self.update(guard, 0.04)
+
+        self.assertEqual(outside.map_steps, 0)
+        self.assertEqual(reentered.map_steps, 1)
+        self.assertEqual(reentered.directional_change, 0.0)
+
+    def test_missing_height_disables_passive_trigger(self):
+        guard = self.make_guard()
+        decision = self.update(guard, np.nan)
+
+        self.assertFalse(decision.height_available)
+        self.assertFalse(decision.confirmed)
+        self.assertEqual(decision.map_steps, 0)
 
 
 class CarrotHeightDirectionGuardTest(unittest.TestCase):

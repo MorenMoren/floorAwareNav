@@ -20,7 +20,7 @@ class Qwen3_6Client:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3.6-27B",
+        model_name: str = "Qwen/Qwen3.6-35B-A3B",
         base_url: str = "http://172.16.33.7:11435/v1",
     ) -> None:
         from openai import OpenAI

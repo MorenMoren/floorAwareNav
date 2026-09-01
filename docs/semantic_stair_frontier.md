@@ -87,7 +87,7 @@ The stair scorer reuses the same multimodal Qwen3.6 client instance as
 key. Configure the existing OpenAI-compatible endpoint as usual:
 
 ```bash
-export ASCENT_QWEN_MODEL=Qwen/Qwen3.6-27B
+export ASCENT_QWEN_MODEL=Qwen/Qwen3.6-35B-A3B
 export ASCENT_QWEN_BASE_URL=http://your-qwen-server/v1
 export ASCENT_QWEN_API_KEY=EMPTY
 ```
@@ -106,6 +106,9 @@ export ASCENT_STAIR_HYSTERESIS_RATIO=1.2
 export ASCENT_STAIR_HEIGHT_WINDOW_STEPS=5
 export ASCENT_STAIR_HEIGHT_CHANGE_THRESHOLD=0.03
 export ASCENT_STAIR_EXIT_STABLE_STEPS=6
+export ASCENT_PASSIVE_STAIR_HEIGHT_WINDOW_STEPS=6
+export ASCENT_PASSIVE_STAIR_MIN_MAP_STEPS=3
+export ASCENT_PASSIVE_STAIR_HEIGHT_CHANGE_THRESHOLD=0.05
 export ASCENT_CARROT_HEIGHT_PROBE_FORWARD_STEPS=4
 export ASCENT_CARROT_HEIGHT_CHANGE_THRESHOLD=0.03
 export ASCENT_CARROT_DIRECTION_ROTATE_STEPS=3
@@ -125,6 +128,13 @@ Exit is confirmed only after the directional height change drops below 3 cm
 over the five-step window and the map remains outside for six stable steps.
 With a legacy 2D GPS configuration, this guard is unavailable and behavior
 falls back to the original map-only decision.
+
+Passive stair entry is stricter than stair exit. A 2D stair-map overlap alone
+does not enter `climb_stair`: upstairs additionally requires rising height and
+downstairs falling height. This prevents open stair geometry projected onto
+the floor below from triggering while the robot is merely walking underneath.
+Without 3D GPS, passive entry is disabled; explicit navigation to an already
+selected stair remains available.
 
 The same 3D GPS height also validates the legacy carrot fallback. After a
 carrot is selected, PointNav is allowed a short forward probe. Upstairs must
